@@ -79,6 +79,15 @@ Following prerequisites must be satisfied
 1. Pick one host to act as the launcher client host. Passwordless ssh must be setup from the launcher client host to all other participating client hosts.  `ssh-copy-id` is a useful tool.
 2. The code and data location(discussed in further sections) must be exactly same in every client host including the launcher host. This is because, the same benchmark command is automatically triggered in every participating client host during the distributed training process.
 
+#### Running as root
+When the launcher client is root (common in container or bare-metal benchmark setups), `mpirun` will refuse to launch unless `--allow-run-as-root` is passed to every `mlpstorage` sub-command that triggers MPI (`training datasize`, `training datagen`, `training run`, `checkpointing run`, `kvcache run`). Add it explicitly:
+
+```bash
+mlpstorage training datagen --hosts 127.0.0.1 --model unet3d \
+  --num-processes 8 --data-dir unet3d_data --allow-run-as-root \
+  --param dataset.num_files_train=42000
+```
+
 ### Installation 
 **The following installation steps must be run on every client host that will participate in running the benchmarks.**
 
@@ -164,6 +173,18 @@ positional arguments:
 optional arguments:
   -h, --help            show this help message and exit
   --version             show program's version number and exit
+```
+### Storage Backend Selection (--file/--object)
+The `training`,`checkpointing`, `vectordb` and `kvcache` workloads require you to declare the storage backend under test. Exactly one of the following must be passed to the run sub-command:
+
+| Flag | Backend | When to use |
+|---|---|---|
+| `--file` | POSIX/parallel filesystem (local, NFS, Lustre, GPFS, WekaFS, etc.) accessed via the checkpoint-folder path. | Block storage, file storage, parallel filesystem submissions. |
+| `--object` | S3-compatible object store, accessed via one of the three supported object-store libraries (see `tests/README.md`). | Object-storage submissions. Requires endpoint/bucket env vars (see backend-specific notes). |
+
+These flags are mutually exclusive and one is required. Omitting both produces:
+```
+error: one of the arguments --file --object is required
 ```
 
 #### Training Category
