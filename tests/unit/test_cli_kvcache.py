@@ -308,3 +308,69 @@ class TestKVCacheOptionalFeatures:
         for mode in ['qos', 'predictive']:
             args = parser.parse_args(['run', '--autoscaler-mode', mode])
             assert args.autoscaler_mode == mode
+
+
+class TestKVCacheRunMLPerfArguments:
+    """Tests for MLPerf sequence arguments now on the run subcommand."""
+
+    @pytest.fixture
+    def parser(self):
+        parser = argparse.ArgumentParser()
+        add_kvcache_arguments(parser)
+        return parser
+
+    def test_validate_subcommand_no_longer_exists(self, parser):
+        """The validate subcommand was merged into run; parsing it must fail."""
+        with pytest.raises(SystemExit):
+            parser.parse_args(['validate', '--cache-dir', '/tmp/kv'])
+
+    def test_npernode_default_is_1(self, parser):
+        args = parser.parse_args(['run'])
+        assert args.npernode == 1
+
+    def test_npernode_accepts_value(self, parser):
+        args = parser.parse_args(['run', '--npernode', '4'])
+        assert args.npernode == 4
+
+    def test_npernode_long_form_accepted(self, parser):
+        args = parser.parse_args(['run', '--num-processes-per-client', '2'])
+        assert args.npernode == 2
+
+    def test_seed_default_is_none(self, parser):
+        """seed defaults to None so CLOSED enforcement can detect explicit setting."""
+        args = parser.parse_args(['run'])
+        assert args.seed is None
+
+    def test_seed_accepts_value(self, parser):
+        args = parser.parse_args(['run', '--seed', '42'])
+        assert args.seed == 42
+
+    def test_trials_default_is_none(self, parser):
+        """trials defaults to None so CLOSED enforcement can detect explicit setting."""
+        args = parser.parse_args(['run'])
+        assert args.trials is None
+
+    def test_trials_accepts_value(self, parser):
+        args = parser.parse_args(['run', '--trials', '5'])
+        assert args.trials == 5
+
+    def test_inter_option_delay_default_is_none(self, parser):
+        """inter_option_delay defaults to None so CLOSED enforcement can detect explicit setting."""
+        args = parser.parse_args(['run'])
+        assert args.inter_option_delay is None
+
+    def test_inter_option_delay_accepts_value(self, parser):
+        args = parser.parse_args(['run', '--inter-option-delay', '5'])
+        assert args.inter_option_delay == 5
+
+    def test_config_default_is_none(self, parser):
+        args = parser.parse_args(['run'])
+        assert args.config is None
+
+    def test_config_argument_accepted(self, parser):
+        args = parser.parse_args(['run', '--config', '/path/to/config.yaml'])
+        assert args.config == '/path/to/config.yaml'
+
+    def test_kvcache_bin_path_accepted(self, parser):
+        args = parser.parse_args(['run', '--kvcache-bin-path', '/opt/kv-cache.py'])
+        assert args.kvcache_bin_path == '/opt/kv-cache.py'
