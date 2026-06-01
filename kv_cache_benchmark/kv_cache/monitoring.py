@@ -1,9 +1,11 @@
 """
 Monitoring, autoscaling, and QoS tracking for KV Cache Benchmark.
 
-Contains StorageMetrics, StorageMonitor, WorkloadAutoscaler, and QoSMonitor.
+Contains system metrics, autoscaling, and QoS utilities.
 """
 
+import os
+import sys
 import time
 import logging
 import threading
@@ -16,6 +18,163 @@ from kv_cache.config import cfg
 from kv_cache.models import QoSLevel, QoSSLA, QOS_PROFILES, InferenceRequest
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# SYSTEM METRICS
+# ============================================================================
+
+
+def _read_proc_net_totals() -> Optional[Tuple[int, int]]:
+    """Return total non-loopback RX/TX bytes from /proc/net/dev when available."""
+    path = "/proc/net/dev"
+    if not os.path.exists(path):
+        return None
+    try:
+        total_rx = 0
+        total_tx = 0
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if ":" not in line:
+                    continue
+                iface_raw, payload = line.split(":", 1)
+                iface = iface_raw.strip()
+                if iface == "lo":
+                    continue
+                fields = payload.split()
+                if len(fields) < 9:
+                    continue
+                total_rx += int(fields[0])
+                total_tx += int(fields[8])
+        return total_rx, total_tx
+    except Exception:
+        return None
+
+
+def _read_proc_self_io() -> Dict[str, int]:
+    """Return process read/write byte counters from /proc/self/io when available."""
+    path = "/proc/self/io"
+    values: Dict[str, int] = {}
+    if not os.path.exists(path):
+        return values
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if ":" not in line:
+                    continue
+                key, raw = line.split(":", 1)
+                key = key.strip()
+                if key not in {"read_bytes", "write_bytes"}:
+                    continue
+                values[key] = int(raw.strip())
+    except Exception:
+        return {}
+    return values
+
+
+def _rss_to_bytes(raw_rss: float) -> int:
+    """Normalize `ru_maxrss` into bytes for Linux/macOS hosts."""
+    if raw_rss < 0:
+        return 0
+    # Linux reports KiB. Darwin reports bytes.
+    if sys.platform.startswith("linux"):
+        return int(raw_rss * 1024.0)
+    return int(raw_rss)
+
+
+class SystemMetricsTracker:
+    """Capture run-level host/process metrics without external dependencies."""
+
+    def __init__(self):
+        self._started = False
+        self._start_wall = 0.0
+        self._end_wall = 0.0
+        self._start_proc_cpu = 0.0
+        self._end_proc_cpu = 0.0
+        self._start_rusage = None
+        self._end_rusage = None
+        self._start_net = None
+        self._end_net = None
+        self._start_io: Dict[str, int] = {}
+        self._end_io: Dict[str, int] = {}
+
+    def start(self) -> None:
+        self._started = True
+        self._start_wall = time.perf_counter()
+        self._start_proc_cpu = time.process_time()
+        self._start_rusage = self._get_rusage()
+        self._start_net = _read_proc_net_totals()
+        self._start_io = _read_proc_self_io()
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._end_wall = time.perf_counter()
+        self._end_proc_cpu = time.process_time()
+        self._end_rusage = self._get_rusage()
+        self._end_net = _read_proc_net_totals()
+        self._end_io = _read_proc_self_io()
+
+    def summary(self) -> Dict[str, float]:
+        if not self._started:
+            return {}
+
+        end_wall = self._end_wall if self._end_wall > 0 else time.perf_counter()
+        end_proc_cpu = self._end_proc_cpu if self._end_proc_cpu > 0 else time.process_time()
+        end_rusage = self._end_rusage or self._get_rusage()
+        end_net = self._end_net if self._end_net is not None else _read_proc_net_totals()
+        end_io = self._end_io if self._end_io else _read_proc_self_io()
+
+        elapsed_wall_s = max(end_wall - self._start_wall, 0.0)
+        elapsed_proc_cpu_s = max(end_proc_cpu - self._start_proc_cpu, 0.0)
+        cpu_count = max(os.cpu_count() or 1, 1)
+
+        process_cpu_percent_avg = 0.0
+        host_cpu_percent_avg = 0.0
+        if elapsed_wall_s > 0:
+            process_cpu_percent_avg = (elapsed_proc_cpu_s / elapsed_wall_s) * 100.0
+            host_cpu_percent_avg = process_cpu_percent_avg / float(cpu_count)
+
+        ru_user_start = getattr(self._start_rusage, "ru_utime", 0.0) if self._start_rusage else 0.0
+        ru_sys_start = getattr(self._start_rusage, "ru_stime", 0.0) if self._start_rusage else 0.0
+        ru_user_end = getattr(end_rusage, "ru_utime", 0.0) if end_rusage else 0.0
+        ru_sys_end = getattr(end_rusage, "ru_stime", 0.0) if end_rusage else 0.0
+
+        out: Dict[str, float] = {
+            "elapsed_wall_s": elapsed_wall_s,
+            "process_cpu_time_s": elapsed_proc_cpu_s,
+            "process_cpu_percent_avg": process_cpu_percent_avg,
+            "host_cpu_percent_avg": host_cpu_percent_avg,
+            "process_user_cpu_s": max(ru_user_end - ru_user_start, 0.0),
+            "process_system_cpu_s": max(ru_sys_end - ru_sys_start, 0.0),
+            "cpu_count": float(cpu_count),
+        }
+
+        if end_rusage is not None:
+            out["process_max_rss_bytes"] = float(_rss_to_bytes(float(getattr(end_rusage, "ru_maxrss", 0.0))))
+
+        if self._start_net is not None and end_net is not None:
+            out["fabric_rx_bytes"] = float(max(end_net[0] - self._start_net[0], 0))
+            out["fabric_tx_bytes"] = float(max(end_net[1] - self._start_net[1], 0))
+
+        start_read = int(self._start_io.get("read_bytes", 0))
+        start_write = int(self._start_io.get("write_bytes", 0))
+        end_read = int(end_io.get("read_bytes", 0))
+        end_write = int(end_io.get("write_bytes", 0))
+        if end_read >= start_read:
+            out["process_io_read_bytes"] = float(end_read - start_read)
+        if end_write >= start_write:
+            out["process_io_write_bytes"] = float(end_write - start_write)
+
+        return out
+
+    @staticmethod
+    def _get_rusage():
+        try:
+            import resource
+            return resource.getrusage(resource.RUSAGE_SELF)
+        except Exception:
+            return None
 
 
 # ============================================================================

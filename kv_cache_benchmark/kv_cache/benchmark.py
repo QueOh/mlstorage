@@ -33,7 +33,7 @@ from kv_cache.cache import MultiTierCache
 from kv_cache.conversation import ConversationManager
 from kv_cache.prefix_cache import PrefixType, PrefixCacheManager
 from kv_cache.rag import RAGDocumentManager
-from kv_cache.monitoring import StorageMonitor, WorkloadAutoscaler, QoSMonitor
+from kv_cache.monitoring import StorageMonitor, WorkloadAutoscaler, QoSMonitor, SystemMetricsTracker
 from kv_cache.workload import (
     ValidationEngine, UserSimulator, ShareGPTDatasetLoader,
 )
@@ -54,6 +54,8 @@ class IntegratedBenchmark:
                  num_gpus: int = 1,
                  tensor_parallel: int = 1,
                  cache_dir: str = None,
+                 nvme_backend: str = 'file',
+                 cpcs_config: Optional[Dict] = None,
                  enable_autoscaling: bool = False,
                  autoscaler_mode: str = 'qos',
                  target_saturation: float = 0.8,
@@ -113,6 +115,8 @@ class IntegratedBenchmark:
         self.precondition = precondition
         self.precondition_size_gb = precondition_size_gb
         self.precondition_threads = precondition_threads if precondition_threads > 0 else (os.cpu_count() or 4)
+        self.nvme_backend = str(nvme_backend or 'file')
+        self.cpcs_config = dict(cpcs_config or {})
         self.trace_speedup = trace_speedup
         self.replay_cycles = replay_cycles
         self.prefill_only = prefill_only
@@ -145,6 +149,8 @@ class IntegratedBenchmark:
             gpu_memory_gb=self.total_gpu_memory_gb,
             cpu_memory_gb=cpu_memory_gb,
             cache_dir=cache_dir,
+            nvme_backend=self.nvme_backend,
+            cpcs_config=self.cpcs_config,
             performance_profile=performance_profile,
             seed=seed,
             max_concurrent_allocs=max_concurrent_allocs,
@@ -157,6 +163,7 @@ class IntegratedBenchmark:
         self.rag_manager = RAGDocumentManager(self.cache) if enable_rag else None
         self.qos_monitor = QoSMonitor()
         self.storage_monitor = StorageMonitor(self) if enable_autoscaling else None
+        self.system_metrics_tracker = SystemMetricsTracker()
         self.autoscaler = WorkloadAutoscaler(
             mode=autoscaler_mode,
             initial_users=self.num_users,
@@ -556,8 +563,8 @@ class IntegratedBenchmark:
                     prev_keys = self.conversation_manager.get_all_previous_turn_keys(
                         request.conversation_id, request.turn_number
                     )
-                    for prev_turn_key in prev_keys:
-                        location, read_latency = self.cache.access_cache(prev_turn_key, InferencePhase.DECODE, 'multi_turn')
+                    batch_reads = self.cache.access_cache_many(prev_keys, InferencePhase.DECODE, 'multi_turn')
+                    for _, location, read_latency in batch_reads:
                         if location is not None:
                             storage_latency += read_latency
                             with self.results_lock: self.results['multi_turn_cache_hits'] += 1
@@ -578,8 +585,8 @@ class IntegratedBenchmark:
                 if doc_keys:
                     doc_id = random.choice(doc_keys)
                     chunks = self.rag_manager.retrieve_chunks(doc_id)
-                    for chunk in chunks:
-                        _, read_lat = self.cache.access_cache(chunk.kv_cache_key, InferencePhase.DECODE)
+                    rag_keys = [chunk.kv_cache_key for chunk in chunks]
+                    for _, _, read_lat in self.cache.access_cache_many(rag_keys, InferencePhase.DECODE):
                         storage_latency += read_lat
 
             # 5. Perform the DECODE operation (a cache READ).
@@ -1240,12 +1247,14 @@ class IntegratedBenchmark:
             mon_thread.start()
 
         benchmark_start = time.time()
+        self.system_metrics_tracker.start()
         stop_event.wait(timeout=self.duration)
         actual_duration = time.time() - benchmark_start
 
         stop_event.set()
         for thread in threads:
             thread.join(timeout=2.0)
+        self.system_metrics_tracker.stop()
 
         # Stop tracing and collect results before stats calculation
         trace_data = None
@@ -1405,6 +1414,7 @@ class IntegratedBenchmark:
         qos_metrics = self.qos_monitor.get_all_qos_metrics()
         prefix_stats = self.prefix_cache_manager.stats if self.prefix_cache_manager else {}
         autoscaling_stats = self.autoscaler.scaling_history if self.autoscaler else []
+        system_metrics = self.system_metrics_tracker.summary()
 
         autoscaling_summary = None
         if self.autoscaler:
@@ -1456,6 +1466,7 @@ class IntegratedBenchmark:
             'prefix_cache_stats': prefix_stats,
             'autoscaling_stats': autoscaling_stats,
             'autoscaling_summary': autoscaling_summary,
+            'system_metrics': system_metrics,
             'multi_turn_stats': {
                 'cache_hits': self.results['multi_turn_cache_hits'],
                 'cache_misses': self.results['multi_turn_cache_misses'],
@@ -1463,6 +1474,12 @@ class IntegratedBenchmark:
                            max(self.results['multi_turn_cache_hits'] + self.results['multi_turn_cache_misses'], 1)
             }
         }
+        if 'host_cpu_percent_avg' in system_metrics:
+            summary['host_cpu_percent_avg'] = system_metrics['host_cpu_percent_avg']
+        if 'fabric_rx_bytes' in system_metrics:
+            summary['fabric_rx_bytes'] = system_metrics['fabric_rx_bytes']
+        if 'fabric_tx_bytes' in system_metrics:
+            summary['fabric_tx_bytes'] = system_metrics['fabric_tx_bytes']
         self.results['summary'] = summary
         self._print_summary(summary)
 

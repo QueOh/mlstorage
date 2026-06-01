@@ -10,7 +10,7 @@ import time
 import hashlib
 import logging
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -20,6 +20,7 @@ from kv_cache.models import ModelConfig, InferencePhase
 from kv_cache.backends import (
     StorageBackend, GPUMemoryBackend, CPUMemoryBackend, NVMeBackend, NullBackend,
 )
+from kv_cache.cpcs_backend import CPCSNVMeBackend
 from kv_cache.tracer import IOTracer
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,8 @@ class MultiTierCache:
                  gpu_memory_gb: float,
                  cpu_memory_gb: float,
                  cache_dir: str = None,
+                 nvme_backend: str = 'file',
+                 cpcs_config: Optional[Dict[str, Any]] = None,
                  eviction_policy: str = 'lru',
                  performance_profile: str = 'latency',
                  seed: Optional[int] = None,
@@ -229,6 +232,8 @@ class MultiTierCache:
         self.max_concurrent_allocs = max_concurrent_allocs
         self.tensor_parallel = max(1, tensor_parallel)
         self.io_tracer = io_tracer
+        self.nvme_backend = str(nvme_backend or 'file')
+        self.cpcs_config = dict(cpcs_config or {})
 
         # Initialize storage backends for each tier.
         # In trace mode all backends are NullBackend — no real hardware I/O.
@@ -249,7 +254,15 @@ class MultiTierCache:
                 logger.warning(f"Could not initialize GPU backend: {e}")
 
             self.backends['cpu'] = CPUMemoryBackend()
-            self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
+            if self.nvme_backend == 'file':
+                self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
+            elif self.nvme_backend == 'cpcs':
+                self.backends['nvme'] = CPCSNVMeBackend(
+                    base_path=cache_dir,
+                    cpcs_config=self.cpcs_config,
+                )
+            else:
+                raise ValueError(f"Unsupported NVMe backend: {self.nvme_backend}")
 
         self.generator = KVCacheGenerator(model_config, global_seed=self.seed)
 
@@ -833,6 +846,150 @@ class MultiTierCache:
             except Exception as e:
                 return location, 0.0
 
+    def access_cache_many(self, keys: List[str], phase: InferencePhase = InferencePhase.DECODE,
+                          cache_type: str = 'user') -> List[Tuple[str, Optional[str], float]]:
+        """
+        Batch access helper for multi-key decode paths.
+
+        Returns tuples in input order: (key, location_or_none, latency_seconds).
+        """
+        if not keys:
+            return []
+
+        results: List[Tuple[str, Optional[str], float]] = [(str(k), None, 0.0) for k in keys]
+        key_positions: Dict[str, List[int]] = {}
+        for idx, key in enumerate(keys):
+            key_positions.setdefault(str(key), []).append(idx)
+
+        existing_keys: List[str] = []
+        missing_count = 0
+        with self.metadata_lock:
+            for key in key_positions.keys():
+                if key in self.cache_entries:
+                    existing_keys.append(key)
+                else:
+                    missing_count += len(key_positions[key])
+
+        if missing_count > 0:
+            with self.stats_lock:
+                self.stats['cache_misses'] += missing_count
+
+        if not existing_keys:
+            return results
+
+        lock_keys = sorted(existing_keys)
+        locks = [self._get_entry_lock(k) for k in lock_keys]
+        for lock in locks:
+            lock.acquire()
+
+        try:
+            # Build read plan by tier while updating access metadata/stats.
+            read_plan_by_tier: Dict[str, List[Tuple[str, int]]] = {}
+            late_miss_count = 0
+
+            for key in existing_keys:
+                with self.metadata_lock:
+                    entry = self.cache_entries.get(key)
+                    if entry is None:
+                        late_miss_count += len(key_positions[key])
+                        continue
+                    location = entry['location']
+                    entry_size = int(entry['size'])
+                    entry['last_access'] = time.time()
+                    entry['access_count'] += 1
+
+                with self.stats_lock:
+                    self.stats['cache_hits'] += len(key_positions[key])
+                    if cache_type == 'system':
+                        self.stats['system_prompt_hits'] += len(key_positions[key])
+                    elif cache_type == 'common':
+                        self.stats['common_phrase_hits'] += len(key_positions[key])
+                    elif cache_type == 'multi_turn':
+                        self.stats['multi_turn_hits'] += len(key_positions[key])
+                    else:
+                        self.stats['user_cache_hits'] += len(key_positions[key])
+
+                    tier_stats_name = 'storage' if location == 'nvme' else location
+                    self.stats[f'tier_{tier_stats_name}_kv_bytes_read'] += entry_size * len(key_positions[key])
+                    if phase == InferencePhase.DECODE:
+                        self.stats['decode_reads'] += len(key_positions[key])
+                    self.stats['read_operations'] += len(key_positions[key])
+                    self.stats['total_read_bytes'] += entry_size * len(key_positions[key])
+
+                read_plan_by_tier.setdefault(location, []).append((key, entry_size))
+
+            if late_miss_count > 0:
+                with self.stats_lock:
+                    self.stats['cache_misses'] += late_miss_count
+
+            # Execute per-tier reads, using backend batch path when available.
+            for location, entries in read_plan_by_tier.items():
+                backend = self.backends[location]
+                unique_keys: List[str] = []
+                seen = set()
+                for key, _ in entries:
+                    if key not in seen:
+                        seen.add(key)
+                        unique_keys.append(key)
+
+                timings_by_key: Dict[str, StorageBackend.IOTiming] = {}
+                can_batch = len(unique_keys) > 1 and hasattr(backend, 'read_many')
+                if can_batch and hasattr(backend, 'supports_batch_read'):
+                    try:
+                        can_batch = bool(getattr(backend, 'supports_batch_read')())
+                    except Exception:
+                        can_batch = False
+
+                if can_batch:
+                    try:
+                        batch_data = backend.read_many(unique_keys)  # type: ignore[attr-defined]
+                        for key, pair in batch_data.items():
+                            if isinstance(pair, tuple) and len(pair) == 2:
+                                timings_by_key[str(key)] = pair[1]
+                    except Exception:
+                        timings_by_key = {}
+
+                if not timings_by_key:
+                    for key in unique_keys:
+                        try:
+                            _, timing = backend.read(key)
+                            timings_by_key[key] = timing
+                        except Exception:
+                            pass
+
+                for key, entry_size in entries:
+                    positions = key_positions.get(key, [])
+                    timing = timings_by_key.get(key)
+                    if timing is None:
+                        for pos in positions:
+                            results[pos] = (key, location, 0.0)
+                        continue
+
+                    if self.io_tracer is not None:
+                        for _ in positions:
+                            self.io_tracer.log('Read', entry_size, location, key=key, phase=phase.value.capitalize())
+
+                    with self.stats_lock:
+                        if location == 'gpu':
+                            self.stats['gpu_read_latencies'].extend([timing.total] * len(positions))
+                        elif location == 'cpu':
+                            self.stats['cpu_read_latencies'].extend([timing.total] * len(positions))
+                        else:
+                            self.stats['storage_read_latencies'].extend([timing.total] * len(positions))
+                            self.stats['storage_read_device_latencies'].extend([timing.device] * len(positions))
+                            self.stats['storage_read_host_latencies'].extend([timing.host] * len(positions))
+                            if self.model_config.kv_cache_size_per_token > 0:
+                                num_tokens = entry_size / self.model_config.kv_cache_size_per_token
+                                self.stats['storage_tokens_processed'] += num_tokens * len(positions)
+
+                    for pos in positions:
+                        results[pos] = (key, location, float(timing.total))
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+        return results
+
     def _evaluate_storage_performance(self, duration: float) -> Dict:
         """Evaluates storage performance against MLPerf Storage WG criteria."""
         criteria = []
@@ -1022,6 +1179,15 @@ class MultiTierCache:
                 stats[f'storage_{op}_host_p99_ms'] = np.percentile(host_array, 99) * 1000
                 stats[f'storage_{op}_host_p999_ms'] = np.percentile(host_array, 99.9) * 1000
                 stats[f'storage_{op}_host_p9999_ms'] = np.percentile(host_array, 99.99) * 1000
+
+        nvme_backend = self.backends.get('nvme')
+        if nvme_backend is not None and hasattr(nvme_backend, 'get_metrics_summary'):
+            cpcs_metrics = nvme_backend.get_metrics_summary()
+            if isinstance(cpcs_metrics, dict):
+                stats['cpcs_metrics'] = cpcs_metrics
+                for key, value in cpcs_metrics.items():
+                    if isinstance(value, (int, float)):
+                        stats[key] = value
 
         return stats
 

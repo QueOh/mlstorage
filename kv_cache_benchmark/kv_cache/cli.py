@@ -26,6 +26,7 @@ from kv_cache.models import (
 )
 from kv_cache.workload import validate_args
 from kv_cache.benchmark import IntegratedBenchmark
+from kv_cache.cpcs_spdk_inventory import load_spdk_inventory_defaults
 
 if TORCH_AVAILABLE:
     import torch
@@ -59,6 +60,12 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
                 return default
         return d
 
+    def first_non_none(*values):
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
     run_params = {
         'Timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'Model': args.model,
@@ -87,6 +94,10 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'Precondition Threads': args.precondition_threads if args.precondition_threads > 0 else (os.cpu_count() or 4),
         'Trace Speedup': args.trace_speedup,
         'Replay Cycles': args.replay_cycles,
+        'NVMe Backend': getattr(args, 'nvme_backend', 'file'),
+        'CPCS Mode': getattr(args, 'cpcs_mode', 'off'),
+        'CPCS Client': getattr(args, 'cpcs_client', 'mock'),
+        'CPCS Storage Mode': getattr(args, 'cpcs_storage_mode', 'file'),
     }
 
     metrics = {
@@ -96,6 +107,9 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'Avg Throughput (tok/s)': summary.get('avg_throughput_tokens_per_sec'),
         'Storage Throughput (tok/s)': summary.get('storage_throughput_tokens_per_sec'),
         'Requests/sec': summary.get('requests_per_second'),
+        'Host CPU Avg (%)': first_non_none(summary.get('host_cpu_percent_avg'), get_nested(summary, ['system_metrics', 'host_cpu_percent_avg'])),
+        'Fabric RX Bytes': first_non_none(summary.get('fabric_rx_bytes'), get_nested(summary, ['system_metrics', 'fabric_rx_bytes'])),
+        'Fabric TX Bytes': first_non_none(summary.get('fabric_tx_bytes'), get_nested(summary, ['system_metrics', 'fabric_tx_bytes'])),
 
         'E2E Latency Mean (ms)': get_nested(summary, ['end_to_end_latency_ms', 'mean']),
         'E2E Latency P50 (ms)': get_nested(summary, ['end_to_end_latency_ms', 'p50']),
@@ -330,6 +344,118 @@ def main():
                         help='Total CPU DRAM to allocate for the KV cache spill tier in GiB.')
     parser.add_argument('--cache-dir', type=str, default=None,
                         help='The directory to use for the NVMe cache tier.')
+    parser.add_argument('--nvme-backend', type=str, default='file', choices=['file', 'cpcs'],
+                        help='NVMe backend implementation. "file" preserves original behavior.')
+    parser.add_argument('--cpcs-mode', type=str, default='off',
+                        choices=['off', 'noop', 'lossless_compress', 'int8_quantize', 'layout', 'block_select', 'prefix_index'],
+                        help='CPCS operation mode (used when --nvme-backend cpcs).')
+    parser.add_argument('--cpcs-client', type=str, default='mock', choices=['mock', 'spdk_passthru'],
+                        help='CPCS client transport.')
+    parser.add_argument('--cpcs-storage-mode', type=str, default='file', choices=['file', 'arena'],
+                        help='CPCS storage layout mode for persisted payloads.')
+    parser.add_argument('--spdk-inventory', type=str, default='',
+                        help='Optional SPDK inventory YAML for passthru defaults.')
+    parser.add_argument('--spdk-rpc-script', type=str, default='scripts/rpc.py',
+                        help='SPDK rpc.py path (reserved for runtime/bootstrap integration).')
+    parser.add_argument('--spdk-rpc-python', type=str, default='python3',
+                        help='Python interpreter used to execute rpc.py bootstrap calls.')
+    parser.add_argument('--spdk-rpc-socket', type=str, default='',
+                        help='Optional SPDK RPC socket path for bootstrap calls.')
+    parser.add_argument('--bootstrap-subsystem-nqn', type=str, default='',
+                        help='Optional subsystem NQN override for CPCS bootstrap RPC calls.')
+    parser.add_argument('--cpcs-bootstrap-check', action='store_true',
+                        help='When enabled, verify SPDK rpc.py method availability during CPCS backend init.')
+    parser.add_argument('--cpcs-bootstrap-install-builtins', action='store_true',
+                        help='Install built-in CPCS programs through rpc.py during backend init.')
+    parser.add_argument('--cpcs-bootstrap-list-programs', action='store_true',
+                        help='Collect cpcs_program_list output through rpc.py during backend init.')
+    parser.add_argument('--cpcs-bootstrap-list-mrs', action='store_true',
+                        help='Collect cpcs_mrs_list output through rpc.py during backend init.')
+    parser.add_argument('--cpcs-required-rpc-methods', type=str, default='',
+                        help='Comma-separated list of rpc.py methods required when bootstrap check is enabled.')
+    parser.add_argument('--spdk-nvme-passthru', type=str, default='',
+                        help='Path to spdk_nvme_passthru binary.')
+    parser.add_argument('--trtype', type=str, default='TCP', help='NVMe-oF transport type.')
+    parser.add_argument('--traddr', type=str, default='', help='NVMe-oF transport address.')
+    parser.add_argument('--trsvcid', type=str, default='', help='NVMe-oF transport service ID.')
+    parser.add_argument('--subnqn', type=str, default='', help='NVMe-oF subsystem NQN.')
+    parser.add_argument('--hostnqn', type=str, default='', help='NVMe host NQN.')
+    parser.add_argument('--src-addr', type=str, default='', help='Optional source IP for NVMe-oF connection.')
+    parser.add_argument('--src-svcid', type=str, default='', help='Optional source service id for NVMe-oF connection.')
+    parser.add_argument('--passthru-lcores', type=str, default='1', help='lcores string for spdk_nvme_passthru.')
+    parser.add_argument('--dataset-nsid', type=int, default=0, help='Dataset namespace NSID.')
+    parser.add_argument('--slm-nsid', type=int, default=0, help='SLM namespace NSID.')
+    parser.add_argument('--cpcs-nsid', type=int, default=0, help='CPCS namespace NSID.')
+    parser.add_argument('--cpcs-program-pind', type=int, default=0, help='Program index for CPCS execute.')
+    parser.add_argument('--cpcs-program-pind-pack-store', type=int, default=-1,
+                        help='Override PIND for pack_store writes (-1 inherits --cpcs-program-pind).')
+    parser.add_argument('--cpcs-program-pind-unpack-load', type=int, default=-1,
+                        help='Override PIND for unpack_load reads (-1 inherits --cpcs-program-pind).')
+    parser.add_argument('--cpcs-program-pind-layout-repack', type=int, default=-1,
+                        help='Override PIND for layout_repack mode (-1 inherits --cpcs-program-pind).')
+    parser.add_argument('--cpcs-program-pind-block-select', type=int, default=-1,
+                        help='Override PIND for block_select mode (-1 inherits --cpcs-program-pind).')
+    parser.add_argument('--cpcs-program-pind-prefix-lookup', type=int, default=-1,
+                        help='Override PIND for prefix_lookup mode (-1 inherits --cpcs-program-pind).')
+    parser.add_argument('--cpcs-program-pind-batch-read', type=int, default=-1,
+                        help='Override PIND for batch_read descriptors (-1 inherits --cpcs-program-pind).')
+    parser.add_argument('--cpcs-rsid', type=int, default=1, help='Memory range set ID for CPCS execute.')
+    parser.add_argument('--cpcs-rsid-pack-store', type=int, default=-1,
+                        help='Override RSID for pack_store writes (-1 inherits --cpcs-rsid).')
+    parser.add_argument('--cpcs-rsid-unpack-load', type=int, default=-1,
+                        help='Override RSID for unpack_load reads (-1 inherits --cpcs-rsid).')
+    parser.add_argument('--cpcs-rsid-layout-repack', type=int, default=-1,
+                        help='Override RSID for layout_repack mode (-1 inherits --cpcs-rsid).')
+    parser.add_argument('--cpcs-rsid-block-select', type=int, default=-1,
+                        help='Override RSID for block_select mode (-1 inherits --cpcs-rsid).')
+    parser.add_argument('--cpcs-rsid-prefix-lookup', type=int, default=-1,
+                        help='Override RSID for prefix_lookup mode (-1 inherits --cpcs-rsid).')
+    parser.add_argument('--cpcs-rsid-batch-read', type=int, default=-1,
+                        help='Override RSID for batch_read descriptors (-1 inherits --cpcs-rsid).')
+    parser.add_argument('--cpcs-auto-create-mrs', action='store_true',
+                        help='Auto-create a CPCS MRS during backend initialization.')
+    parser.add_argument('--cpcs-mrs-ranges', type=str, default='',
+                        help='MRS ranges spec: "offset:length,..." or JSON list with offset/length fields.')
+    parser.add_argument('--cpcs-mrs-default-length-bytes', type=int, default=65536,
+                        help='Default MRS length used when auto-create is enabled and ranges are omitted.')
+    parser.add_argument('--cpcs-mrs-align-bytes', type=int, default=0,
+                        help='Alignment size for MRS ranges (0 uses direct-probe LBA bytes).')
+    parser.add_argument('--cpcs-mrs-align-mode', type=str, default='round', choices=['none', 'strict', 'round'],
+                        help='MRS alignment policy: none/strict/round.')
+    parser.add_argument('--cpcs-load-program-path', type=str, default='',
+                        help='Optional CPCS program binary path to load via admin opcode 0x85.')
+    parser.add_argument('--cpcs-load-program-pind', type=int, default=-1,
+                        help='Program index used for --cpcs-load-program-path (-1 uses --cpcs-program-pind).')
+    parser.add_argument('--cpcs-load-program-set-default-pind', action='store_true',
+                        help='Use --cpcs-load-program-pind as the default execute PIND for CPCS ops.')
+    parser.add_argument('--cpcs-load-program-chunk-bytes', type=int, default=0,
+                        help='Chunk size for admin opcode 0x85 program load (0 = single transfer).')
+    parser.add_argument('--cpcs-load-program-ptype', type=lambda x: int(x, 0), default=0xC0,
+                        help='Program type (PTYPE) for program load; accepts decimal or hex (e.g. 0xC0).')
+    parser.add_argument('--cpcs-load-program-pit', type=lambda x: int(x, 0), default=0x01,
+                        help='Program implementation type (PIT) for program load; accepts decimal or hex.')
+    parser.add_argument('--cpcs-load-program-puid', type=lambda x: int(x, 0), default=0xEBF00001,
+                        help='Program UID (PUID) for program load; accepts decimal or hex.')
+    parser.add_argument('--cpcs-activate-loaded-program', action='store_true',
+                        help='Activate the loaded CPCS program via admin opcode 0x88 after loading.')
+    parser.add_argument('--direct-probe-offset', type=int, default=0, help='Probe read offset in bytes.')
+    parser.add_argument('--direct-probe-length', type=int, default=4096, help='Probe read length in bytes.')
+    parser.add_argument('--direct-probe-lba-bytes', type=int, default=0, help='LBA size used for probe alignment.')
+    parser.add_argument('--cpcs-slm-rw-lba-bytes', type=int, default=0,
+                        help='LBA size used for SLM raw read/write in lba mode (0 uses --direct-probe-lba-bytes).')
+    parser.add_argument('--cpcs-slm-read-address-mode', type=str, default='byte', choices=['byte', 'lba'],
+                        help='Addressing mode for SLM reads (byte follows CPCS vector scripts).')
+    parser.add_argument('--cpcs-slm-write-address-mode', type=str, default='lba', choices=['byte', 'lba'],
+                        help='Addressing mode for SLM writes in arena mode.')
+    parser.add_argument('--cpcs-arena-path', type=str, default='', help='Arena path for CPCS arena mode.')
+    parser.add_argument('--cpcs-index-path', type=str, default='', help='Index path for CPCS metadata.')
+    parser.add_argument('--cpcs-metrics-output', type=str, default='', help='Optional path for CPCS metrics JSON.')
+    parser.add_argument('--cpcs-verify-every-n', type=int, default=0, help='Periodic verification interval (0=off).')
+    parser.add_argument('--cpcs-lossy-tolerance', type=float, default=0.0, help='Tolerance for lossy CPCS modes.')
+    parser.add_argument('--cpcs-block-size-kb', type=int, default=1024, help='Logical CPCS block size in KiB.')
+    parser.add_argument('--cpcs-batch-size', type=int, default=1, help='Batch size hint for CPCS layout mode.')
+    parser.add_argument('--cpcs-fallback-on-error', action='store_true',
+                        help='Fallback to raw storage behavior if CPCS command fails.')
     parser.add_argument('--generation-mode', type=str, default='realistic', choices=[g.value for g in GenerationMode],
                         help='The token generation speed simulation mode.')
     parser.add_argument('--performance-profile', type=str, default='latency', choices=['latency', 'throughput'],
@@ -413,6 +539,64 @@ def main():
     if args.io_trace_log:
         logger.info(f"Trace mode active: I/O operations will be logged to {args.io_trace_log} (no real hardware I/O)")
 
+    # Optional passthru defaults from SPDK inventory YAML.
+    if args.nvme_backend == 'cpcs' and args.spdk_inventory:
+        inventory_defaults = load_spdk_inventory_defaults(args.spdk_inventory)
+
+        def _apply_if_empty(name, empty_values):
+            cur = getattr(args, name)
+            if cur in empty_values and name in inventory_defaults:
+                setattr(args, name, inventory_defaults[name])
+
+        _apply_if_empty('trtype', {'', None})
+        _apply_if_empty('traddr', {'', None})
+        _apply_if_empty('trsvcid', {'', None})
+        _apply_if_empty('subnqn', {'', None})
+        _apply_if_empty('hostnqn', {'', None})
+        _apply_if_empty('bootstrap_subsystem_nqn', {'', None})
+        _apply_if_empty('src_addr', {'', None})
+        _apply_if_empty('src_svcid', {'', None})
+        _apply_if_empty('passthru_lcores', {'', None})
+        _apply_if_empty('cpcs_bootstrap_install_builtins', {False, None})
+        _apply_if_empty('cpcs_bootstrap_list_programs', {False, None})
+        _apply_if_empty('cpcs_bootstrap_list_mrs', {False, None})
+        _apply_if_empty('dataset_nsid', {0, None})
+        _apply_if_empty('slm_nsid', {0, None})
+        _apply_if_empty('cpcs_nsid', {0, None})
+        _apply_if_empty('cpcs_program_pind', {0, None})
+        _apply_if_empty('cpcs_rsid', {1, 0, None})
+        _apply_if_empty('cpcs_program_pind_pack_store', {-1, None})
+        _apply_if_empty('cpcs_program_pind_unpack_load', {-1, None})
+        _apply_if_empty('cpcs_program_pind_layout_repack', {-1, None})
+        _apply_if_empty('cpcs_program_pind_block_select', {-1, None})
+        _apply_if_empty('cpcs_program_pind_prefix_lookup', {-1, None})
+        _apply_if_empty('cpcs_program_pind_batch_read', {-1, None})
+        _apply_if_empty('cpcs_rsid_pack_store', {-1, None})
+        _apply_if_empty('cpcs_rsid_unpack_load', {-1, None})
+        _apply_if_empty('cpcs_rsid_layout_repack', {-1, None})
+        _apply_if_empty('cpcs_rsid_block_select', {-1, None})
+        _apply_if_empty('cpcs_rsid_prefix_lookup', {-1, None})
+        _apply_if_empty('cpcs_rsid_batch_read', {-1, None})
+        _apply_if_empty('cpcs_auto_create_mrs', {False, None})
+        _apply_if_empty('cpcs_mrs_ranges', {'', None})
+        _apply_if_empty('cpcs_mrs_default_length_bytes', {65536, 0, None})
+        _apply_if_empty('cpcs_mrs_align_bytes', {0, None})
+        _apply_if_empty('cpcs_mrs_align_mode', {'round', '', None})
+        _apply_if_empty('cpcs_load_program_path', {'', None})
+        _apply_if_empty('cpcs_load_program_pind', {-1, None})
+        _apply_if_empty('cpcs_load_program_set_default_pind', {False, None})
+        _apply_if_empty('cpcs_load_program_chunk_bytes', {0, None})
+        _apply_if_empty('cpcs_load_program_ptype', {0xC0, None})
+        _apply_if_empty('cpcs_load_program_pit', {0x01, None})
+        _apply_if_empty('cpcs_load_program_puid', {0xEBF00001, None})
+        _apply_if_empty('cpcs_activate_loaded_program', {False, None})
+        _apply_if_empty('direct_probe_offset', {0, None})
+        _apply_if_empty('direct_probe_length', {0, None})
+        _apply_if_empty('direct_probe_lba_bytes', {0, None})
+        _apply_if_empty('cpcs_slm_rw_lba_bytes', {0, None})
+        _apply_if_empty('cpcs_slm_read_address_mode', {'byte', '', None})
+        _apply_if_empty('cpcs_slm_write_address_mode', {'lba', '', None})
+
     if args.config:
         config = ConfigLoader(args.config)
         set_config(config)
@@ -443,6 +627,75 @@ def main():
 
     model_config = CURRENT_MODEL_CONFIGS[args.model]
     gen_mode = GenerationMode(args.generation_mode)
+    cpcs_config = {
+        'mode': args.cpcs_mode,
+        'client': args.cpcs_client,
+        'storage_mode': args.cpcs_storage_mode,
+        'spdk_rpc_script': args.spdk_rpc_script,
+        'spdk_rpc_python': args.spdk_rpc_python,
+        'spdk_rpc_socket': args.spdk_rpc_socket,
+        'bootstrap_subsystem_nqn': args.bootstrap_subsystem_nqn,
+        'bootstrap_check': args.cpcs_bootstrap_check,
+        'bootstrap_install_builtins': args.cpcs_bootstrap_install_builtins,
+        'bootstrap_list_programs': args.cpcs_bootstrap_list_programs,
+        'bootstrap_list_mrs': args.cpcs_bootstrap_list_mrs,
+        'required_rpc_methods': args.cpcs_required_rpc_methods,
+        'spdk_nvme_passthru': args.spdk_nvme_passthru,
+        'trtype': args.trtype,
+        'traddr': args.traddr,
+        'trsvcid': args.trsvcid,
+        'subnqn': args.subnqn,
+        'hostnqn': args.hostnqn,
+        'src_addr': args.src_addr,
+        'src_svcid': args.src_svcid,
+        'passthru_lcores': args.passthru_lcores,
+        'dataset_nsid': args.dataset_nsid,
+        'slm_nsid': args.slm_nsid,
+        'cpcs_nsid': args.cpcs_nsid,
+        'cpcs_program_pind': args.cpcs_program_pind,
+        'cpcs_program_pind_pack_store': args.cpcs_program_pind_pack_store,
+        'cpcs_program_pind_unpack_load': args.cpcs_program_pind_unpack_load,
+        'cpcs_program_pind_layout_repack': args.cpcs_program_pind_layout_repack,
+        'cpcs_program_pind_block_select': args.cpcs_program_pind_block_select,
+        'cpcs_program_pind_prefix_lookup': args.cpcs_program_pind_prefix_lookup,
+        'cpcs_program_pind_batch_read': args.cpcs_program_pind_batch_read,
+        'cpcs_rsid': args.cpcs_rsid,
+        'cpcs_rsid_pack_store': args.cpcs_rsid_pack_store,
+        'cpcs_rsid_unpack_load': args.cpcs_rsid_unpack_load,
+        'cpcs_rsid_layout_repack': args.cpcs_rsid_layout_repack,
+        'cpcs_rsid_block_select': args.cpcs_rsid_block_select,
+        'cpcs_rsid_prefix_lookup': args.cpcs_rsid_prefix_lookup,
+        'cpcs_rsid_batch_read': args.cpcs_rsid_batch_read,
+        'auto_create_mrs': args.cpcs_auto_create_mrs,
+        'mrs_ranges': args.cpcs_mrs_ranges,
+        'mrs_default_length_bytes': args.cpcs_mrs_default_length_bytes,
+        'mrs_align_bytes': args.cpcs_mrs_align_bytes,
+        'mrs_align_mode': args.cpcs_mrs_align_mode,
+        'load_program_path': args.cpcs_load_program_path,
+        'load_program_pind': args.cpcs_load_program_pind,
+        'load_program_set_default_pind': args.cpcs_load_program_set_default_pind,
+        'load_program_chunk_bytes': args.cpcs_load_program_chunk_bytes,
+        'load_program_ptype': args.cpcs_load_program_ptype,
+        'load_program_pit': args.cpcs_load_program_pit,
+        'load_program_puid': args.cpcs_load_program_puid,
+        'activate_loaded_program': args.cpcs_activate_loaded_program,
+        'direct_probe_offset': args.direct_probe_offset,
+        'direct_probe_length': args.direct_probe_length,
+        'direct_probe_lba_bytes': args.direct_probe_lba_bytes if args.direct_probe_lba_bytes > 0 else 4096,
+        'slm_rw_lba_bytes': args.cpcs_slm_rw_lba_bytes if args.cpcs_slm_rw_lba_bytes > 0 else (
+            args.direct_probe_lba_bytes if args.direct_probe_lba_bytes > 0 else 4096
+        ),
+        'slm_read_address_mode': args.cpcs_slm_read_address_mode,
+        'slm_write_address_mode': args.cpcs_slm_write_address_mode,
+        'arena_path': args.cpcs_arena_path,
+        'index_path': args.cpcs_index_path,
+        'metrics_output': args.cpcs_metrics_output,
+        'verify_every_n': args.cpcs_verify_every_n,
+        'lossy_tolerance': args.cpcs_lossy_tolerance,
+        'block_size_kb': args.cpcs_block_size_kb,
+        'batch_size': args.cpcs_batch_size,
+        'fallback_on_error': args.cpcs_fallback_on_error,
+    }
 
     benchmark = IntegratedBenchmark(
         model_config=model_config,
@@ -453,6 +706,8 @@ def main():
         cpu_memory_gb=args.cpu_mem_gb,
         duration_seconds=args.duration,
         cache_dir=args.cache_dir,
+        nvme_backend=args.nvme_backend,
+        cpcs_config=cpcs_config,
         enable_autoscaling=args.enable_autoscaling,
         autoscaler_mode=args.autoscaler_mode,
         target_saturation=args.target_saturation,
@@ -484,6 +739,88 @@ def main():
     )
 
     results = benchmark.run()
+    results.setdefault('metadata', {})
+    results['metadata']['nvme_backend'] = args.nvme_backend
+    results['metadata']['cpcs'] = {
+        'enabled': args.nvme_backend == 'cpcs',
+        'mode': args.cpcs_mode,
+        'client': args.cpcs_client,
+        'storage_mode': args.cpcs_storage_mode,
+        'spdk_inventory': args.spdk_inventory,
+        'bootstrap': {
+            'enabled': (
+                args.cpcs_bootstrap_check
+                or args.cpcs_bootstrap_install_builtins
+                or args.cpcs_bootstrap_list_programs
+                or args.cpcs_bootstrap_list_mrs
+            ),
+            'rpc_script': args.spdk_rpc_script,
+            'rpc_python': args.spdk_rpc_python,
+            'rpc_socket': args.spdk_rpc_socket,
+            'subsystem_nqn': args.bootstrap_subsystem_nqn or args.subnqn,
+            'install_builtins': args.cpcs_bootstrap_install_builtins,
+            'list_programs': args.cpcs_bootstrap_list_programs,
+            'list_mrs': args.cpcs_bootstrap_list_mrs,
+            'required_methods': args.cpcs_required_rpc_methods,
+        },
+        'transport': {
+            'trtype': args.trtype,
+            'traddr': args.traddr,
+            'trsvcid': args.trsvcid,
+            'subnqn': args.subnqn,
+            'hostnqn': args.hostnqn,
+            'src_addr': args.src_addr,
+            'src_svcid': args.src_svcid,
+        },
+        'namespaces': {
+            'dataset_nsid': args.dataset_nsid,
+            'slm_nsid': args.slm_nsid,
+            'cpcs_nsid': args.cpcs_nsid,
+        },
+        'slm': {
+            'rw_lba_bytes': args.cpcs_slm_rw_lba_bytes if args.cpcs_slm_rw_lba_bytes > 0 else (
+                args.direct_probe_lba_bytes if args.direct_probe_lba_bytes > 0 else 4096
+            ),
+            'read_address_mode': args.cpcs_slm_read_address_mode,
+            'write_address_mode': args.cpcs_slm_write_address_mode,
+        },
+        'program': {
+            'default_pind': args.cpcs_program_pind,
+            'pack_store_pind': args.cpcs_program_pind_pack_store,
+            'unpack_load_pind': args.cpcs_program_pind_unpack_load,
+            'layout_repack_pind': args.cpcs_program_pind_layout_repack,
+            'block_select_pind': args.cpcs_program_pind_block_select,
+            'prefix_lookup_pind': args.cpcs_program_pind_prefix_lookup,
+            'batch_read_pind': args.cpcs_program_pind_batch_read,
+            'rsid': args.cpcs_rsid,
+            'pack_store_rsid': args.cpcs_rsid_pack_store,
+            'unpack_load_rsid': args.cpcs_rsid_unpack_load,
+            'layout_repack_rsid': args.cpcs_rsid_layout_repack,
+            'block_select_rsid': args.cpcs_rsid_block_select,
+            'prefix_lookup_rsid': args.cpcs_rsid_prefix_lookup,
+            'batch_read_rsid': args.cpcs_rsid_batch_read,
+            'load_program_path': args.cpcs_load_program_path,
+            'load_program_pind': args.cpcs_load_program_pind,
+            'load_program_set_default_pind': args.cpcs_load_program_set_default_pind,
+            'load_program_chunk_bytes': args.cpcs_load_program_chunk_bytes,
+            'load_program_ptype': args.cpcs_load_program_ptype,
+            'load_program_pit': args.cpcs_load_program_pit,
+            'load_program_puid': args.cpcs_load_program_puid,
+            'activate_loaded_program': args.cpcs_activate_loaded_program,
+        },
+        'mrs': {
+            'auto_create': args.cpcs_auto_create_mrs,
+            'ranges': args.cpcs_mrs_ranges,
+            'default_length_bytes': args.cpcs_mrs_default_length_bytes,
+            'align_bytes': args.cpcs_mrs_align_bytes,
+            'align_mode': args.cpcs_mrs_align_mode,
+        },
+        'layout': {
+            'arena_path': args.cpcs_arena_path,
+            'index_path': args.cpcs_index_path,
+            'metrics_output': args.cpcs_metrics_output,
+        },
+    }
 
     def convert_numpy(obj):
         if isinstance(obj, np.ndarray):

@@ -125,6 +125,48 @@ FORBIDDEN_CACHE_PREFIXES = frozenset([
 ])
 
 
+def _validate_mrs_ranges_spec(spec: str) -> None:
+    def _to_int(v) -> int:
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, int):
+            return int(v)
+        return int(str(v).strip(), 0)
+
+    text = str(spec or "").strip()
+    if not text:
+        return
+
+    if text.startswith("["):
+        payload = json.loads(text)
+        if not isinstance(payload, list):
+            raise ValueError("MRS ranges JSON must be a list")
+        for item in payload:
+            if not isinstance(item, dict):
+                raise ValueError("MRS ranges JSON entries must be objects")
+            start = _to_int(item.get("starting_byte", item.get("offset", 0)) or 0)
+            length = _to_int(item.get("length", item.get("length_bytes", 0)) or 0)
+            if start < 0:
+                raise ValueError(f"MRS range offset must be >= 0, got {start}")
+            if length <= 0:
+                raise ValueError(f"MRS range length must be > 0, got {length}")
+        return
+
+    for token in text.split(","):
+        part = token.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"Invalid MRS range token: {part}")
+        off_text, len_text = part.split(":", 1)
+        offset = _to_int(off_text)
+        length = _to_int(len_text)
+        if offset < 0:
+            raise ValueError(f"MRS range offset must be >= 0, got {offset}")
+        if length <= 0:
+            raise ValueError(f"MRS range length must be > 0, got {length}")
+
+
 def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     """
     Validate command-line arguments to catch invalid values early.
@@ -220,6 +262,200 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         parent = cache_path.parent
         if parent.exists() and not os.access(parent, os.W_OK):
             errors.append(f"--cache-dir parent is not writable: {parent}")
+
+    nvme_backend = str(getattr(args, 'nvme_backend', 'file') or 'file')
+    if nvme_backend not in ('file', 'cpcs'):
+        errors.append(f"--nvme-backend must be one of file|cpcs, got {nvme_backend}")
+
+    cpcs_mode = str(getattr(args, 'cpcs_mode', 'off') or 'off')
+    cpcs_client = str(getattr(args, 'cpcs_client', 'mock') or 'mock')
+    cpcs_storage_mode = str(getattr(args, 'cpcs_storage_mode', 'file') or 'file')
+    if nvme_backend == 'cpcs':
+        if cpcs_mode == 'off':
+            errors.append("--cpcs-mode cannot be 'off' when --nvme-backend cpcs")
+        if cpcs_storage_mode not in ('file', 'arena'):
+            errors.append(f"--cpcs-storage-mode must be one of file|arena, got {cpcs_storage_mode}")
+
+        verify_every_n = int(getattr(args, 'cpcs_verify_every_n', 0) or 0)
+        if verify_every_n < 0:
+            errors.append(f"--cpcs-verify-every-n cannot be negative, got {verify_every_n}")
+
+        lossy_tolerance = float(getattr(args, 'cpcs_lossy_tolerance', 0.0) or 0.0)
+        if lossy_tolerance < 0:
+            errors.append(f"--cpcs-lossy-tolerance cannot be negative, got {lossy_tolerance}")
+
+        block_size_kb = int(getattr(args, 'cpcs_block_size_kb', 0) or 0)
+        if block_size_kb <= 0:
+            errors.append(f"--cpcs-block-size-kb must be > 0, got {block_size_kb}")
+        batch_size = int(getattr(args, 'cpcs_batch_size', 0) or 0)
+        if batch_size <= 0:
+            errors.append(f"--cpcs-batch-size must be > 0, got {batch_size}")
+
+        if cpcs_storage_mode == 'arena':
+            arena_path = str(getattr(args, 'cpcs_arena_path', '') or '').strip()
+            index_path = str(getattr(args, 'cpcs_index_path', '') or '').strip()
+            if arena_path:
+                arena_parent = Path(arena_path).expanduser().resolve().parent
+                if arena_parent.exists() and not os.access(arena_parent, os.W_OK):
+                    errors.append(f"--cpcs-arena-path parent is not writable: {arena_parent}")
+            if index_path:
+                index_parent = Path(index_path).expanduser().resolve().parent
+                if index_parent.exists() and not os.access(index_parent, os.W_OK):
+                    errors.append(f"--cpcs-index-path parent is not writable: {index_parent}")
+
+        default_pind = int(getattr(args, 'cpcs_program_pind', 0) or 0)
+        if default_pind < 0:
+            errors.append(f"--cpcs-program-pind must be >= 0, got {default_pind}")
+        cpcs_rsid = int(getattr(args, 'cpcs_rsid', 1) or 1)
+        if cpcs_rsid <= 0:
+            errors.append(f"--cpcs-rsid must be > 0, got {cpcs_rsid}")
+
+        rsid_overrides = {
+            '--cpcs-rsid-pack-store': int(getattr(args, 'cpcs_rsid_pack_store', -1) or -1),
+            '--cpcs-rsid-unpack-load': int(getattr(args, 'cpcs_rsid_unpack_load', -1) or -1),
+            '--cpcs-rsid-layout-repack': int(getattr(args, 'cpcs_rsid_layout_repack', -1) or -1),
+            '--cpcs-rsid-block-select': int(getattr(args, 'cpcs_rsid_block_select', -1) or -1),
+            '--cpcs-rsid-prefix-lookup': int(getattr(args, 'cpcs_rsid_prefix_lookup', -1) or -1),
+            '--cpcs-rsid-batch-read': int(getattr(args, 'cpcs_rsid_batch_read', -1) or -1),
+        }
+        for name, value in rsid_overrides.items():
+            if value == 0 or value < -1:
+                errors.append(f"{name} must be > 0 or -1, got {value}")
+
+        pind_overrides = {
+            '--cpcs-program-pind-pack-store': int(getattr(args, 'cpcs_program_pind_pack_store', -1) or -1),
+            '--cpcs-program-pind-unpack-load': int(getattr(args, 'cpcs_program_pind_unpack_load', -1) or -1),
+            '--cpcs-program-pind-layout-repack': int(getattr(args, 'cpcs_program_pind_layout_repack', -1) or -1),
+            '--cpcs-program-pind-block-select': int(getattr(args, 'cpcs_program_pind_block_select', -1) or -1),
+            '--cpcs-program-pind-prefix-lookup': int(getattr(args, 'cpcs_program_pind_prefix_lookup', -1) or -1),
+            '--cpcs-program-pind-batch-read': int(getattr(args, 'cpcs_program_pind_batch_read', -1) or -1),
+        }
+        for name, value in pind_overrides.items():
+            if value < -1:
+                errors.append(f"{name} must be >= -1, got {value}")
+
+        mrs_default_len = int(getattr(args, 'cpcs_mrs_default_length_bytes', 65536) or 65536)
+        if mrs_default_len <= 0:
+            errors.append(f"--cpcs-mrs-default-length-bytes must be > 0, got {mrs_default_len}")
+        mrs_align_bytes = int(getattr(args, 'cpcs_mrs_align_bytes', 0) or 0)
+        if mrs_align_bytes < 0:
+            errors.append(f"--cpcs-mrs-align-bytes must be >= 0, got {mrs_align_bytes}")
+        mrs_align_mode = str(getattr(args, 'cpcs_mrs_align_mode', 'round') or 'round').strip().lower()
+        if mrs_align_mode not in ('none', 'strict', 'round'):
+            errors.append(f"--cpcs-mrs-align-mode must be one of none|strict|round, got {mrs_align_mode}")
+        mrs_ranges = str(getattr(args, 'cpcs_mrs_ranges', '') or '').strip()
+        if mrs_ranges:
+            try:
+                _validate_mrs_ranges_spec(mrs_ranges)
+            except Exception as exc:
+                errors.append(f"--cpcs-mrs-ranges invalid: {exc}")
+
+        load_program_path = str(getattr(args, 'cpcs_load_program_path', '') or '').strip()
+        load_program_pind = int(getattr(args, 'cpcs_load_program_pind', -1) or -1)
+        load_program_set_default_pind = bool(getattr(args, 'cpcs_load_program_set_default_pind', False))
+        load_program_chunk_bytes = int(getattr(args, 'cpcs_load_program_chunk_bytes', 0) or 0)
+        load_program_ptype = int(getattr(args, 'cpcs_load_program_ptype', 0xC0) or 0xC0)
+        load_program_pit = int(getattr(args, 'cpcs_load_program_pit', 0x01) or 0x01)
+        load_program_puid = int(getattr(args, 'cpcs_load_program_puid', 0xEBF00001) or 0xEBF00001)
+        if load_program_path:
+            prog_path = Path(load_program_path).expanduser()
+            if not prog_path.exists():
+                errors.append(f"--cpcs-load-program-path not found: {prog_path}")
+        if load_program_pind < -1:
+            errors.append(f"--cpcs-load-program-pind must be >= -1, got {load_program_pind}")
+        if load_program_set_default_pind and load_program_pind < 0:
+            errors.append("--cpcs-load-program-set-default-pind requires --cpcs-load-program-pind >= 0")
+        if load_program_chunk_bytes < 0:
+            errors.append(f"--cpcs-load-program-chunk-bytes must be >= 0, got {load_program_chunk_bytes}")
+        if load_program_ptype < 0 or load_program_ptype > 0xFF:
+            errors.append(f"--cpcs-load-program-ptype must be in [0,255], got {load_program_ptype}")
+        if load_program_pit < 0 or load_program_pit > 0x7:
+            errors.append(f"--cpcs-load-program-pit must be in [0,7], got {load_program_pit}")
+        if load_program_puid < 0 or load_program_puid > 0xFFFFFFFFFFFFFFFF:
+            errors.append(f"--cpcs-load-program-puid must be in [0, 2^64-1], got {load_program_puid}")
+
+        slm_rw_lba_bytes = int(getattr(args, 'cpcs_slm_rw_lba_bytes', 0) or 0)
+        if slm_rw_lba_bytes < 0:
+            errors.append(f"--cpcs-slm-rw-lba-bytes must be >= 0, got {slm_rw_lba_bytes}")
+        slm_read_mode = str(getattr(args, 'cpcs_slm_read_address_mode', 'byte') or 'byte').strip().lower()
+        if slm_read_mode not in ('byte', 'lba'):
+            errors.append(f"--cpcs-slm-read-address-mode must be one of byte|lba, got {slm_read_mode}")
+        slm_write_mode = str(getattr(args, 'cpcs_slm_write_address_mode', 'lba') or 'lba').strip().lower()
+        if slm_write_mode not in ('byte', 'lba'):
+            errors.append(f"--cpcs-slm-write-address-mode must be one of byte|lba, got {slm_write_mode}")
+
+        if cpcs_client == 'spdk_passthru':
+            spdk_inventory = str(getattr(args, 'spdk_inventory', '') or '').strip()
+            traddr = str(getattr(args, 'traddr', '') or '').strip()
+            trsvcid = str(getattr(args, 'trsvcid', '') or '').strip()
+            subnqn = str(getattr(args, 'subnqn', '') or '').strip()
+            hostnqn = str(getattr(args, 'hostnqn', '') or '').strip()
+            spdk_passthru = str(getattr(args, 'spdk_nvme_passthru', '') or '').strip()
+            bootstrap_check = bool(getattr(args, 'cpcs_bootstrap_check', False))
+            bootstrap_install_builtins = bool(getattr(args, 'cpcs_bootstrap_install_builtins', False))
+            bootstrap_list_programs = bool(getattr(args, 'cpcs_bootstrap_list_programs', False))
+            bootstrap_list_mrs = bool(getattr(args, 'cpcs_bootstrap_list_mrs', False))
+            spdk_rpc_script = str(getattr(args, 'spdk_rpc_script', '') or '').strip()
+            required_rpc_methods = str(getattr(args, 'cpcs_required_rpc_methods', '') or '').strip()
+            bootstrap_subsystem_nqn = str(getattr(args, 'bootstrap_subsystem_nqn', '') or '').strip()
+
+            if not spdk_passthru:
+                errors.append("--spdk-nvme-passthru is required for --cpcs-client spdk_passthru")
+            if (bootstrap_check or bootstrap_install_builtins or bootstrap_list_programs or bootstrap_list_mrs) and not spdk_rpc_script:
+                errors.append("--spdk-rpc-script is required when bootstrap RPC actions are enabled")
+            if required_rpc_methods:
+                methods = [m.strip() for m in required_rpc_methods.split(",")]
+                if any(not m for m in methods):
+                    errors.append("--cpcs-required-rpc-methods must be a comma-separated list without empty entries")
+            if (bootstrap_install_builtins or bootstrap_list_programs or bootstrap_list_mrs) and not (bootstrap_subsystem_nqn or subnqn):
+                errors.append("Bootstrap RPC actions require --subnqn or --bootstrap-subsystem-nqn")
+
+            if not spdk_inventory:
+                if not traddr:
+                    errors.append("--traddr is required for spdk_passthru unless --spdk-inventory is used")
+                if not trsvcid:
+                    errors.append("--trsvcid is required for spdk_passthru unless --spdk-inventory is used")
+                if not subnqn:
+                    errors.append("--subnqn is required for spdk_passthru unless --spdk-inventory is used")
+                if not hostnqn:
+                    errors.append("--hostnqn is required for spdk_passthru unless --spdk-inventory is used")
+
+            dataset_nsid = int(getattr(args, 'dataset_nsid', 0) or 0)
+            slm_nsid = int(getattr(args, 'slm_nsid', 0) or 0)
+            cpcs_nsid = int(getattr(args, 'cpcs_nsid', 0) or 0)
+            if dataset_nsid <= 0:
+                errors.append(f"--dataset-nsid must be > 0 for spdk_passthru, got {dataset_nsid}")
+            if slm_nsid <= 0:
+                errors.append(f"--slm-nsid must be > 0 for spdk_passthru, got {slm_nsid}")
+            if cpcs_nsid <= 0:
+                errors.append(f"--cpcs-nsid must be > 0 for spdk_passthru, got {cpcs_nsid}")
+
+            probe_off = int(getattr(args, 'direct_probe_offset', 0) or 0)
+            probe_len = int(getattr(args, 'direct_probe_length', 0) or 0)
+            probe_lba = int(getattr(args, 'direct_probe_lba_bytes', 0) or 0)
+            if probe_off < 0:
+                errors.append(f"--direct-probe-offset cannot be negative, got {probe_off}")
+            if probe_len <= 0:
+                errors.append(f"--direct-probe-length must be > 0, got {probe_len}")
+            if probe_lba <= 0:
+                errors.append(f"--direct-probe-lba-bytes must be > 0, got {probe_lba}")
+            if probe_lba > 0 and probe_len > 0:
+                if (probe_off % probe_lba) != 0:
+                    errors.append("--direct-probe-offset must align to --direct-probe-lba-bytes")
+                if (probe_len % probe_lba) != 0:
+                    errors.append("--direct-probe-length must align to --direct-probe-lba-bytes")
+
+            effective_slm_lba = int(slm_rw_lba_bytes if slm_rw_lba_bytes > 0 else probe_lba)
+            if slm_read_mode == 'lba' and effective_slm_lba <= 0:
+                errors.append("--cpcs-slm-read-address-mode lba requires positive LBA bytes")
+            if slm_write_mode == 'lba' and effective_slm_lba <= 0:
+                errors.append("--cpcs-slm-write-address-mode lba requires positive LBA bytes")
+
+            if bool(getattr(args, 'cpcs_auto_create_mrs', False)) and probe_lba > 0 and mrs_ranges:
+                try:
+                    _validate_mrs_ranges_spec(mrs_ranges)
+                except Exception as exc:
+                    errors.append(f"Invalid auto-created MRS ranges: {exc}")
 
     if errors:
         for error in errors:

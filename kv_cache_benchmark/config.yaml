@@ -209,6 +209,79 @@ saturation_detection:
   history_window_size: 10         # Number of samples for trend analysis
 
 # =============================================================================
+# CPCS SETTINGS
+# Default values for CPCS backend integration (used when --nvme-backend cpcs).
+# =============================================================================
+cpcs:
+  mode: "off"
+  client: "mock"
+  storage_mode: "file"
+  verify_every_n: 0
+  lossy_tolerance: 0.0
+  block_size_kb: 1024
+  batch_size: 1
+  fallback_on_error: false
+  arena_path: ""
+  index_path: ""
+  metrics_output: ""
+
+  # SPDK passthru defaults
+  spdk_rpc_script: "scripts/rpc.py"
+  spdk_rpc_python: "python3"
+  spdk_rpc_socket: ""
+  bootstrap_subsystem_nqn: ""
+  bootstrap_check: false
+  bootstrap_install_builtins: false
+  bootstrap_list_programs: false
+  bootstrap_list_mrs: false
+  required_rpc_methods: ""
+  spdk_nvme_passthru: ""
+  trtype: "TCP"
+  traddr: ""
+  trsvcid: ""
+  subnqn: ""
+  hostnqn: ""
+  src_addr: ""
+  src_svcid: ""
+  passthru_lcores: "1"
+  dataset_nsid: 0
+  slm_nsid: 0
+  cpcs_nsid: 0
+  cpcs_program_pind: 0
+  cpcs_program_pind_pack_store: -1
+  cpcs_program_pind_unpack_load: -1
+  cpcs_program_pind_layout_repack: -1
+  cpcs_program_pind_block_select: -1
+  cpcs_program_pind_prefix_lookup: -1
+  cpcs_program_pind_batch_read: -1
+  cpcs_rsid: 1
+  cpcs_rsid_pack_store: -1
+  cpcs_rsid_unpack_load: -1
+  cpcs_rsid_layout_repack: -1
+  cpcs_rsid_block_select: -1
+  cpcs_rsid_prefix_lookup: -1
+  cpcs_rsid_batch_read: -1
+  auto_create_mrs: false
+  mrs_ranges: ""
+  mrs_default_length_bytes: 65536
+  mrs_align_bytes: 0
+  mrs_align_mode: "round"
+  load_program_path: ""
+  load_program_pind: -1
+  load_program_set_default_pind: false
+  load_program_chunk_bytes: 0
+  load_program_ptype: 192
+  load_program_pit: 1
+  load_program_puid: 3958376449
+  activate_loaded_program: false
+  direct_probe_offset: 0
+  direct_probe_length: 4096
+  direct_probe_lba_bytes: 0
+  slm_rw_lba_bytes: 0
+  slm_read_address_mode: "byte"
+  slm_write_address_mode: "lba"
+
+# =============================================================================
 # VALIDATION LIMITS
 # Safety limits for CLI argument validation.
 # =============================================================================

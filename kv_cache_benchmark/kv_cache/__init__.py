@@ -65,6 +65,15 @@ from kv_cache.backends import (
     CPUMemoryBackend,
     NVMeBackend,
 )
+from kv_cache.cpcs_backend import CPCSNVMeBackend
+from kv_cache.cpcs_client import (
+    CPCSClient,
+    CPCSResult,
+    MockCPCSClient,
+    SpdkPassthruCPCSClient,
+    SpdkRpcBootstrap,
+)
+from kv_cache.cpcs_metrics import CPCSMetrics
 
 # GPU backend is optional (requires CUDA)
 try:
@@ -84,6 +93,7 @@ from kv_cache.monitoring import (
     StorageMonitor,
     WorkloadAutoscaler,
     QoSMonitor,
+    SystemMetricsTracker,
 )
 
 # Workload generation and validation
@@ -129,11 +139,12 @@ __all__ = [
     # RAG
     'RAGChunk', 'RAGDocument', 'RAGQuery', 'RAGDocumentManager',
     # Backends
-    'StorageBackend', 'GPUMemoryBackend', 'CPUMemoryBackend', 'NVMeBackend',
+    'StorageBackend', 'GPUMemoryBackend', 'CPUMemoryBackend', 'NVMeBackend', 'CPCSNVMeBackend',
+    'CPCSClient', 'CPCSResult', 'MockCPCSClient', 'SpdkPassthruCPCSClient', 'SpdkRpcBootstrap', 'CPCSMetrics',
     # Cache engine
     'KVCacheGenerator', 'MultiTierCache',
     # Monitoring
-    'StorageMetrics', 'StorageMonitor', 'WorkloadAutoscaler', 'QoSMonitor',
+    'StorageMetrics', 'StorageMonitor', 'WorkloadAutoscaler', 'QoSMonitor', 'SystemMetricsTracker',
     # Workload
     'RealTraceEntry', 'ValidationEngine', 'UserSimulator', 'ShareGPTDatasetLoader',
     'validate_args', 'MAX_USERS', 'MAX_DURATION_SECONDS',
