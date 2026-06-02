@@ -26,6 +26,15 @@ from kv_cache.cpcs_metrics import CPCSMetrics
 class CPCSNVMeBackend(StorageBackend):
     """Storage backend with CPCS mode support."""
 
+    _SPDK_KV_BUILTIN_PIND_DEFAULTS: Dict[str, int] = {
+        "pack_store": 7,
+        "unpack_load": 8,
+        "layout_repack": 9,
+        "block_select": 10,
+        "prefix_lookup": 11,
+        "batch_read": 12,
+    }
+
     def __init__(self, base_path: Optional[str], cpcs_config: Optional[Dict[str, Any]] = None):
         config = dict(cpcs_config or {})
 
@@ -47,6 +56,12 @@ class CPCSNVMeBackend(StorageBackend):
         self.mrs_default_length_bytes = int(config.get("mrs_default_length_bytes", 65536) or 65536)
         self.mrs_align_bytes = int(config.get("mrs_align_bytes", 0) or 0)
         self.mrs_align_mode = str(config.get("mrs_align_mode", "round") or "round").strip().lower()
+        self._known_mrs_ranges: List[Dict[str, int]] = []
+        self._execute_output_ops = {"pack_store", "unpack_load", "layout_repack"}
+        self.execute_output_enable = bool(config.get("execute_output_enable", True))
+        self.execute_output_mr_id = int(config.get("execute_output_mr_id", 1) or 1)
+        self.execute_output_offset_bytes = int(config.get("execute_output_offset_bytes", 0) or 0)
+        self.execute_output_max_bytes = int(config.get("execute_output_max_bytes", 0) or 0)
         self.load_program_path = str(config.get("load_program_path", "") or "").strip()
         self.load_program_pind = int(config.get("load_program_pind", -1) or -1)
         self.load_program_set_default_pind = bool(config.get("load_program_set_default_pind", False))
@@ -104,6 +119,13 @@ class CPCSNVMeBackend(StorageBackend):
             self.slm_read_address_mode = "byte"
         if self.slm_write_address_mode not in {"byte", "lba"}:
             self.slm_write_address_mode = "lba"
+        if self.execute_output_mr_id <= 0:
+            self.execute_output_mr_id = 1
+        if self.execute_output_offset_bytes < 0:
+            self.execute_output_offset_bytes = 0
+        if self.execute_output_max_bytes < 0:
+            self.execute_output_max_bytes = 0
+        self._load_known_mrs_ranges_from_config()
 
         self.metadata: Dict[str, Dict[str, Any]] = {}
         self.metrics = CPCSMetrics()
@@ -140,13 +162,34 @@ class CPCSNVMeBackend(StorageBackend):
         return cls._resolve_id_override(value, fallback, 1)
 
     def _build_pind_map(self, config: Dict[str, Any]) -> Dict[str, int]:
+        default_pind = int(self.cpcs_pind)
+        if self.client_type == "spdk_passthru":
+            default_pind = int(max(0, self._SPDK_KV_BUILTIN_PIND_DEFAULTS["pack_store"]))
         return {
-            "pack_store": self._resolve_pind_override(config.get("cpcs_program_pind_pack_store", -1), self.cpcs_pind),
-            "unpack_load": self._resolve_pind_override(config.get("cpcs_program_pind_unpack_load", -1), self.cpcs_pind),
-            "layout_repack": self._resolve_pind_override(config.get("cpcs_program_pind_layout_repack", -1), self.cpcs_pind),
-            "block_select": self._resolve_pind_override(config.get("cpcs_program_pind_block_select", -1), self.cpcs_pind),
-            "prefix_lookup": self._resolve_pind_override(config.get("cpcs_program_pind_prefix_lookup", -1), self.cpcs_pind),
-            "batch_read": self._resolve_pind_override(config.get("cpcs_program_pind_batch_read", -1), self.cpcs_pind),
+            "pack_store": self._resolve_pind_override(
+                config.get("cpcs_program_pind_pack_store", -1),
+                self._SPDK_KV_BUILTIN_PIND_DEFAULTS["pack_store"] if self.client_type == "spdk_passthru" else default_pind,
+            ),
+            "unpack_load": self._resolve_pind_override(
+                config.get("cpcs_program_pind_unpack_load", -1),
+                self._SPDK_KV_BUILTIN_PIND_DEFAULTS["unpack_load"] if self.client_type == "spdk_passthru" else default_pind,
+            ),
+            "layout_repack": self._resolve_pind_override(
+                config.get("cpcs_program_pind_layout_repack", -1),
+                self._SPDK_KV_BUILTIN_PIND_DEFAULTS["layout_repack"] if self.client_type == "spdk_passthru" else default_pind,
+            ),
+            "block_select": self._resolve_pind_override(
+                config.get("cpcs_program_pind_block_select", -1),
+                self._SPDK_KV_BUILTIN_PIND_DEFAULTS["block_select"] if self.client_type == "spdk_passthru" else default_pind,
+            ),
+            "prefix_lookup": self._resolve_pind_override(
+                config.get("cpcs_program_pind_prefix_lookup", -1),
+                self._SPDK_KV_BUILTIN_PIND_DEFAULTS["prefix_lookup"] if self.client_type == "spdk_passthru" else default_pind,
+            ),
+            "batch_read": self._resolve_pind_override(
+                config.get("cpcs_program_pind_batch_read", -1),
+                self._SPDK_KV_BUILTIN_PIND_DEFAULTS["batch_read"] if self.client_type == "spdk_passthru" else default_pind,
+            ),
         }
 
     def _build_rsid_map(self, config: Dict[str, Any]) -> Dict[str, int]:
@@ -446,6 +489,154 @@ class CPCSNVMeBackend(StorageBackend):
             out.append({"starting_byte": int(aligned_start), "length": int(aligned_len)})
         return out, adjusted
 
+    def _set_known_mrs_ranges(self, ranges: List[Dict[str, int]]) -> None:
+        normalized: List[Dict[str, int]] = []
+        for item in ranges:
+            start = int(item.get("starting_byte", item.get("offset", 0)) or 0)
+            length = int(item.get("length", item.get("length_bytes", 0)) or 0)
+            if start < 0 or length <= 0:
+                continue
+            normalized.append({"starting_byte": int(start), "length": int(length)})
+        self._known_mrs_ranges = normalized
+
+    def _load_known_mrs_ranges_from_config(self) -> None:
+        try:
+            ranges = self._parse_mrs_ranges_spec(self.mrs_ranges_spec)
+        except Exception:
+            return
+        if not ranges:
+            if not self.auto_create_mrs:
+                return
+            ranges = self._default_mrs_ranges()
+        ranges, _ = self._normalize_mrs_ranges(ranges)
+        self._set_known_mrs_ranges(ranges)
+
+    def _build_execute_output_target(
+        self,
+        op: str,
+        rsid: int,
+        payload_bytes: int,
+        exec_extra: Dict[str, Any],
+    ) -> Optional[Dict[str, int]]:
+        if self.client_type != "spdk_passthru" or not self.execute_output_enable:
+            return None
+        if str(op) not in self._execute_output_ops:
+            return None
+        if int(rsid) != int(self.cpcs_rsid):
+            return None
+        if not self._known_mrs_ranges:
+            return None
+
+        mr_id = int(max(1, self.execute_output_mr_id))
+        mr_index = mr_id - 1
+        if mr_index < 0 or mr_index >= len(self._known_mrs_ranges):
+            return None
+
+        mr = self._known_mrs_ranges[mr_index]
+        mr_off = int(max(0, self.execute_output_offset_bytes))
+        mr_len = int(mr["length"])
+        if mr_off >= mr_len:
+            return None
+
+        max_bytes = int(mr_len - mr_off)
+        if self.execute_output_max_bytes > 0:
+            max_bytes = int(min(max_bytes, self.execute_output_max_bytes))
+        if max_bytes <= 0:
+            return None
+
+        # Skip output targeting when payload is clearly larger than available MR capacity.
+        if payload_bytes > 0 and int(payload_bytes) > int(max_bytes):
+            return None
+
+        exec_extra["output_mr_id"] = int(mr_id)
+        exec_extra["output_offset"] = int(mr_off)
+        exec_extra["output_length"] = int(max_bytes)
+        exec_extra["output_contract"] = "mr_range"
+
+        return {
+            "mr_id": int(mr_id),
+            "mr_offset": int(mr_off),
+            "max_bytes": int(max_bytes),
+            "slm_offset": int(mr["starting_byte"] + mr_off),
+        }
+
+    def _read_slm_payload(self, *, offset: int, length: int, metrics_mode: str) -> bytes:
+        if length <= 0:
+            return b""
+
+        if self.slm_read_address_mode == "lba":
+            lba = int(max(1, self.slm_rw_lba_bytes))
+            aligned_offset = (int(offset) // lba) * lba
+            head = int(offset - aligned_offset)
+            aligned_length = self._align_up(int(max(1, head + length)), lba)
+            read_t0 = time.perf_counter()
+            raw = self.client.slm_read(
+                slm_nsid=self.slm_nsid,
+                offset_bytes=aligned_offset,
+                length_bytes=aligned_length,
+                address_mode="lba",
+                lba_bytes=lba,
+            )
+            self._record_slm_read_metrics(metrics_mode, aligned_length, time.perf_counter() - read_t0)
+            payload = raw[head : head + length]
+        else:
+            read_t0 = time.perf_counter()
+            payload = self.client.slm_read(
+                slm_nsid=self.slm_nsid,
+                offset_bytes=int(offset),
+                length_bytes=int(length),
+                address_mode="byte",
+            )
+            self._record_slm_read_metrics(metrics_mode, length, time.perf_counter() - read_t0)
+
+        if len(payload) != int(length):
+            raise IOError(f"Short SLM read for execute output: expected {length}, got {len(payload)}")
+        return bytes(payload)
+
+    def _consume_execute_output_payload(
+        self,
+        *,
+        op: str,
+        result: Any,
+        target: Optional[Dict[str, int]],
+        metrics_mode: str,
+    ) -> Optional[bytes]:
+        if target is None:
+            return None
+        if not isinstance(getattr(result, "extra", None), dict):
+            return None
+
+        extra = result.extra
+        result_raw = int(extra.get("result_raw", extra.get("result_dw0", 0)) or 0)
+        result_value = int(extra.get("result_value", result_raw & 0xFFFFFFFF) or 0)
+        result_crc = int(extra.get("result_crc32", (result_raw >> 32) & 0xFFFFFFFF) or 0)
+        if result_value <= 0:
+            return None
+        if result_value > int(target["max_bytes"]):
+            extra["output_mr_truncated"] = True
+            return None
+
+        payload = self._read_slm_payload(
+            offset=int(target["slm_offset"]),
+            length=int(result_value),
+            metrics_mode=f"{metrics_mode}_exec_output_read",
+        )
+        host_crc = int(zlib.crc32(payload) & 0xFFFFFFFF)
+        if result_crc != 0 and host_crc != result_crc:
+            extra["output_mr_crc_mismatch"] = True
+            extra["output_mr_crc_host"] = int(host_crc)
+            extra["output_mr_crc_device"] = int(result_crc)
+            return None
+
+        extra["output_mr_consumed"] = True
+        extra["output_mr_id"] = int(target["mr_id"])
+        extra["output_mr_offset"] = int(target["mr_offset"])
+        extra["output_payload_bytes"] = int(len(payload))
+        extra["output_crc_host"] = int(host_crc)
+        if result_crc != 0:
+            extra["output_crc_match"] = True
+        return payload
+
     def _bootstrap_fail(self, message: str) -> None:
         if self.fallback_on_error:
             self.bootstrap_status["ok"] = False
@@ -472,6 +663,7 @@ class CPCSNVMeBackend(StorageBackend):
             cpcs_nsid=self.cpcs_nsid,
         )
         self.cpcs_rsid = int(max(1, rsid))
+        self._set_known_mrs_ranges(ranges)
         self.bootstrap_status["mrs"] = {
             "auto_create": True,
             "rsid": int(self.cpcs_rsid),
@@ -879,6 +1071,12 @@ class CPCSNVMeBackend(StorageBackend):
             exec_extra = dict(profile["extra"])
             exec_extra["program_rsid"] = int(rsid)
             exec_extra["program_pind"] = int(pind)
+            output_target = self._build_execute_output_target(
+                str(profile["op"]),
+                int(rsid),
+                len(raw_payload),
+                exec_extra,
+            )
             result = self.client.execute(
                 cpcs_nsid=self.cpcs_nsid,
                 rsid=rsid,
@@ -891,7 +1089,13 @@ class CPCSNVMeBackend(StorageBackend):
                 extra=exec_extra,
             )
             self._record_metrics(result, str(profile["metrics_mode"]))
-            packed_payload = result.extra.get("payload", raw_payload)
+            consumed_output = self._consume_execute_output_payload(
+                op=str(profile["op"]),
+                result=result,
+                target=output_target,
+                metrics_mode=str(profile["metrics_mode"]),
+            )
+            packed_payload = consumed_output if consumed_output is not None else result.extra.get("payload", raw_payload)
             extra = dict(result.extra)
             command_latency = float(result.command_latency_s)
         except Exception:
@@ -941,6 +1145,12 @@ class CPCSNVMeBackend(StorageBackend):
         exec_extra = dict(profile["extra"])
         exec_extra["program_rsid"] = int(rsid)
         exec_extra["program_pind"] = int(pind)
+        output_target = self._build_execute_output_target(
+            str(profile["op"]),
+            int(rsid),
+            len(packed_payload),
+            exec_extra,
+        )
 
         result = self.client.execute(
             cpcs_nsid=self.cpcs_nsid,
@@ -955,7 +1165,13 @@ class CPCSNVMeBackend(StorageBackend):
         )
         self._record_metrics(result, str(profile["metrics_mode"]))
 
-        raw_payload = result.extra.get("payload", packed_payload)
+        consumed_output = self._consume_execute_output_payload(
+            op=str(profile["op"]),
+            result=result,
+            target=output_target,
+            metrics_mode=str(profile["metrics_mode"]),
+        )
+        raw_payload = consumed_output if consumed_output is not None else result.extra.get("payload", packed_payload)
         data = self._deserialize_array(raw_payload)
         end = time.perf_counter()
 
@@ -1016,6 +1232,12 @@ class CPCSNVMeBackend(StorageBackend):
         summary["cpcs_program_pind_default"] = int(self.cpcs_pind)
         summary["cpcs_program_pind_by_op"] = dict(self.cpcs_pind_by_op)
         summary["cpcs_program_rsid_by_op"] = dict(self.cpcs_rsid_by_op)
+        summary["cpcs_execute_output_enable"] = bool(self.execute_output_enable)
+        summary["cpcs_execute_output_mr_id"] = int(self.execute_output_mr_id)
+        summary["cpcs_execute_output_offset_bytes"] = int(self.execute_output_offset_bytes)
+        summary["cpcs_execute_output_max_bytes"] = int(self.execute_output_max_bytes)
+        if self._known_mrs_ranges:
+            summary["cpcs_known_mrs_ranges"] = list(self._known_mrs_ranges)
         summary["cpcs_slm_read_address_mode"] = str(self.slm_read_address_mode)
         summary["cpcs_slm_write_address_mode"] = str(self.slm_write_address_mode)
         summary["cpcs_slm_rw_lba_bytes"] = int(self.slm_rw_lba_bytes)

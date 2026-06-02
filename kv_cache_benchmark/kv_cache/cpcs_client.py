@@ -189,7 +189,11 @@ class MockCPCSClient(CPCSClient):
                 output = payload
 
         elapsed = time.perf_counter() - t0
+        result_bits = self._split_result_value(((zlib.crc32(output) & 0xFFFFFFFF) << 32) | (len(output) & 0xFFFFFFFF))
         extra["payload"] = output
+        extra["result_raw"] = int(result_bits["raw"])
+        extra["result_value"] = int(result_bits["value"])
+        extra["result_crc32"] = int(result_bits["crc32"])
         return CPCSResult(
             status="ok",
             output_offset=0,
@@ -422,6 +426,15 @@ class SpdkPassthruCPCSClient(CPCSClient):
     def _parse_result_hex(text: str) -> int:
         m = re.search(r"result[:=]\s*0x([0-9a-fA-F]+)", text)
         return int(m.group(1), 16) if m else 0
+
+    @staticmethod
+    def _split_result_value(raw: int) -> Dict[str, int]:
+        raw64 = int(raw)
+        return {
+            "raw": int(raw64),
+            "value": int(raw64 & 0xFFFFFFFF),
+            "crc32": int((raw64 >> 32) & 0xFFFFFFFF),
+        }
 
     @staticmethod
     def _align_up(value: int, align: int) -> int:
@@ -729,16 +742,20 @@ class SpdkPassthruCPCSClient(CPCSClient):
             ]
             out = self._run_checked(cmd)
             elapsed = time.perf_counter() - t0
+            result_bits = self._split_result_value(self._parse_result_hex(out))
             return CPCSResult(
                 status="ok",
                 output_offset=None,
-                output_length=0,
+                output_length=int(result_bits["value"]),
                 bytes_in=len(framed_payload),
                 bytes_out=0,
                 device_compute_us=int(elapsed * 1_000_000.0),
                 command_latency_s=elapsed,
                 extra={
-                    "result_dw0": self._parse_result_hex(out),
+                    "result_dw0": int(result_bits["raw"]),
+                    "result_raw": int(result_bits["raw"]),
+                    "result_value": int(result_bits["value"]),
+                    "result_crc32": int(result_bits["crc32"]),
                     "framed_request": True,
                     "request_op": op,
                     "request_mode": mode,
