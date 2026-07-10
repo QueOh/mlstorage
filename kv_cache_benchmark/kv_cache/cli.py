@@ -85,6 +85,8 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'Seed': args.seed,
         'Max Concurrent Allocs': args.max_concurrent_allocs,
         'Request Rate': args.request_rate,
+        'Arrival': args.arrival,
+        'SLO (ms)': args.slo_ms or 'N/A',
         'Max Requests': args.max_requests,
         'Dataset Path': args.dataset_path or 'N/A',
         'Cache Dir': args.cache_dir or 'temp',
@@ -489,6 +491,15 @@ def main():
                         help='Limit concurrent allocations. 0 = unlimited.')
     parser.add_argument('--request-rate', type=float, default=0,
                         help='Target request arrival rate (requests/sec). 0 = unlimited.')
+    parser.add_argument('--arrival', type=str, default='fixed', choices=['fixed', 'poisson'],
+                        help='Arrival process for --request-rate pacing: fixed cadence '
+                             '(legacy) or open-loop Poisson (exponential inter-arrivals).')
+    parser.add_argument('--slo-ms', type=float, default=0,
+                        help='End-to-end latency SLO in ms; summary gains slo_attainment '
+                             '(fraction of requests within the SLO). 0 = no SLO.')
+    parser.add_argument('--latency-dump', type=str, default=None,
+                        help='Optional JSONL path for per-request latency records '
+                             '(request_id, qos, phase, e2e_ms, storage_s, tokens).')
     parser.add_argument('--max-requests', type=int, default=0,
                         help='Stop after completing N requests (0 = use duration instead).')
     parser.add_argument('--xlsx-output', type=str, default=None,
@@ -725,6 +736,9 @@ def main():
         seed=args.seed,
         max_concurrent_allocs=args.max_concurrent_allocs,
         request_rate=args.request_rate,
+        arrival=args.arrival,
+        slo_ms=args.slo_ms,
+        latency_dump=args.latency_dump,
         max_requests=args.max_requests,
         storage_capacity_gb=args.storage_capacity_gb,
         precondition=args.precondition,

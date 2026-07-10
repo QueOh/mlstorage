@@ -9,6 +9,7 @@ preconditioning, and summary printing.
 import os
 import sys
 import csv
+import json
 import glob
 import time
 import queue
@@ -83,7 +84,10 @@ class IntegratedBenchmark:
                  prefill_only: bool = False,
                  decode_only: bool = False,
                  io_trace_log: Optional[str] = None,
-                 enable_latency_tracing: bool = False):
+                 enable_latency_tracing: bool = False,
+                 arrival: str = 'fixed',
+                 slo_ms: float = 0,
+                 latency_dump: Optional[str] = None):
 
         self.model_config = model_config
         self.num_users = num_users
@@ -110,6 +114,16 @@ class IntegratedBenchmark:
         self.seed = seed
         self.max_concurrent_allocs = max_concurrent_allocs
         self.request_rate = request_rate
+        # Open-loop arrival process for --request-rate pacing: 'fixed' keeps
+        # the legacy constant cadence; 'poisson' draws exponential
+        # inter-arrival gaps at the same mean rate (serving-style bursts).
+        # Seeded independently of the workload RNG so arrival timing is
+        # reproducible without perturbing content generation.
+        self.arrival = str(arrival or 'fixed')
+        self._arrival_rng = random.Random(seed if seed is not None else 0xA1FE)
+        self.slo_ms = float(slo_ms or 0)
+        self.latency_dump = latency_dump or None
+        self._latency_dump_records: Optional[List[Dict]] = ([] if self.latency_dump else None)
         self.max_requests = max_requests
         self.storage_capacity_gb = storage_capacity_gb
         self.precondition = precondition
@@ -417,7 +431,10 @@ class IntegratedBenchmark:
             turn_index += 1
 
             if self.request_rate > 0:
-                time.sleep(1.0 / self.request_rate)
+                if self.arrival == 'poisson':
+                    time.sleep(self._arrival_rng.expovariate(self.request_rate))
+                else:
+                    time.sleep(1.0 / self.request_rate)
 
     def generate_requests(self, users: List[UserProfile], stop_event: threading.Event):
         """Generate requests concurrently for each simulated user."""
@@ -638,6 +655,16 @@ class IntegratedBenchmark:
                 self.results['end_to_end_latencies'].append(request.total_latency_ms / 1000)
                 self.results['storage_latencies'].append(storage_latency)
                 self.results['generation_latencies'].append(generation_latency)
+                if self._latency_dump_records is not None:
+                    self._latency_dump_records.append({
+                        'request_id': request.request_id,
+                        'qos_level': str(getattr(request, 'qos_level', '')),
+                        'phase': str(getattr(request, 'phase', '')),
+                        'complete_time_s': request.complete_time,
+                        'e2e_ms': request.total_latency_ms,
+                        'storage_s': storage_latency,
+                        'generate_tokens': request.generate_tokens,
+                    })
 
                 if self.max_requests > 0 and self.results['requests_completed'] >= self.max_requests:
                     if self.stop_event:
@@ -1480,7 +1507,22 @@ class IntegratedBenchmark:
             summary['fabric_rx_bytes'] = system_metrics['fabric_rx_bytes']
         if 'fabric_tx_bytes' in system_metrics:
             summary['fabric_tx_bytes'] = system_metrics['fabric_tx_bytes']
+        # Serving-arm additions: SLO attainment over per-request e2e latency
+        # (fraction of requests completing within --slo-ms; None when no SLO
+        # was set) and the arrival process used for --request-rate pacing.
+        summary['arrival'] = self.arrival
+        summary['request_rate'] = self.request_rate or None
+        summary['slo_ms'] = self.slo_ms if self.slo_ms > 0 else None
+        summary['slo_attainment'] = (
+            float(np.mean((e2e * 1000.0) <= self.slo_ms)) if self.slo_ms > 0 else None)
         self.results['summary'] = summary
+        if self.latency_dump and self._latency_dump_records is not None:
+            with self.results_lock:
+                rows = list(self._latency_dump_records)
+            with open(self.latency_dump, 'w') as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + '\n')
+            logger.info(f"Per-request latency dump: {len(rows)} rows -> {self.latency_dump}")
         self._print_summary(summary)
 
     def _print_summary(self, summary: Dict):
