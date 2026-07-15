@@ -213,9 +213,11 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
 
     if args.request_rate < 0:
         errors.append(f"--request-rate cannot be negative, got {args.request_rate}")
-    if getattr(args, 'arrival', 'fixed') == 'poisson' and args.request_rate <= 0:
-        errors.append('--arrival poisson requires --request-rate > 0 '
-                      '(the Poisson process needs a mean arrival rate)')
+    if getattr(args, 'arrival', 'fixed') in ('poisson', 'gamma') and args.request_rate <= 0:
+        errors.append(f"--arrival {args.arrival} requires --request-rate > 0 "
+                      '(the arrival process needs a mean rate)')
+    if getattr(args, 'arrival', 'fixed') == 'gamma' and getattr(args, 'arrival_cv', 2.0) <= 0:
+        errors.append('--arrival-cv must be > 0 for gamma arrivals')
 
     if args.max_requests < 0:
         errors.append(f"--max-requests cannot be negative, got {args.max_requests}")

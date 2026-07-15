@@ -491,9 +491,15 @@ def main():
                         help='Limit concurrent allocations. 0 = unlimited.')
     parser.add_argument('--request-rate', type=float, default=0,
                         help='Target request arrival rate (requests/sec). 0 = unlimited.')
-    parser.add_argument('--arrival', type=str, default='fixed', choices=['fixed', 'poisson'],
+    parser.add_argument('--arrival', type=str, default='fixed',
+                        choices=['fixed', 'poisson', 'gamma'],
                         help='Arrival process for --request-rate pacing: fixed cadence '
-                             '(legacy) or open-loop Poisson (exponential inter-arrivals).')
+                             '(legacy), open-loop Poisson (exponential inter-arrivals), '
+                             'or gamma (burstier-than-Poisson at the same mean rate; '
+                             'see --arrival-cv).')
+    parser.add_argument('--arrival-cv', type=float, default=2.0,
+                        help='Coefficient of variation for --arrival gamma '
+                             '(CV=1 equals Poisson; higher = burstier).')
     parser.add_argument('--slo-ms', type=float, default=0,
                         help='End-to-end latency SLO in ms; summary gains slo_attainment '
                              '(fraction of requests within the SLO). 0 = no SLO.')
@@ -737,6 +743,7 @@ def main():
         max_concurrent_allocs=args.max_concurrent_allocs,
         request_rate=args.request_rate,
         arrival=args.arrival,
+        arrival_cv=args.arrival_cv,
         slo_ms=args.slo_ms,
         latency_dump=args.latency_dump,
         max_requests=args.max_requests,

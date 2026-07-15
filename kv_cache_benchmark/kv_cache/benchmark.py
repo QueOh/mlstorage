@@ -86,6 +86,7 @@ class IntegratedBenchmark:
                  io_trace_log: Optional[str] = None,
                  enable_latency_tracing: bool = False,
                  arrival: str = 'fixed',
+                 arrival_cv: float = 2.0,
                  slo_ms: float = 0,
                  latency_dump: Optional[str] = None):
 
@@ -120,6 +121,10 @@ class IntegratedBenchmark:
         # Seeded independently of the workload RNG so arrival timing is
         # reproducible without perturbing content generation.
         self.arrival = str(arrival or 'fixed')
+        # Gamma arrivals: CV > 1 gives burstier-than-Poisson traffic at the
+        # SAME mean rate (shape k = 1/cv^2, scale = cv^2/rate => mean 1/rate;
+        # the Llumnix burstiness axis). CV is meaningful only for 'gamma'.
+        self.arrival_cv = float(arrival_cv or 2.0)
         self._arrival_rng = random.Random(seed if seed is not None else 0xA1FE)
         self.slo_ms = float(slo_ms or 0)
         self.latency_dump = latency_dump or None
@@ -433,6 +438,10 @@ class IntegratedBenchmark:
             if self.request_rate > 0:
                 if self.arrival == 'poisson':
                     time.sleep(self._arrival_rng.expovariate(self.request_rate))
+                elif self.arrival == 'gamma':
+                    cv2 = self.arrival_cv * self.arrival_cv
+                    time.sleep(self._arrival_rng.gammavariate(
+                        1.0 / cv2, cv2 / self.request_rate))
                 else:
                     time.sleep(1.0 / self.request_rate)
 
@@ -1511,6 +1520,7 @@ class IntegratedBenchmark:
         # (fraction of requests completing within --slo-ms; None when no SLO
         # was set) and the arrival process used for --request-rate pacing.
         summary['arrival'] = self.arrival
+        summary['arrival_cv'] = (self.arrival_cv if self.arrival == 'gamma' else None)
         summary['request_rate'] = self.request_rate or None
         summary['slo_ms'] = self.slo_ms if self.slo_ms > 0 else None
         summary['slo_attainment'] = (
