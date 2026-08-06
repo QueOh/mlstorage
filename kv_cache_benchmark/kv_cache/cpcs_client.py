@@ -38,6 +38,15 @@ class CPCSResult:
 class CPCSClient:
     """Abstract CPCS client interface."""
 
+    @staticmethod
+    def _split_result_value(raw: int) -> Dict[str, int]:
+        raw64 = int(raw)
+        return {
+            "raw": int(raw64),
+            "value": int(raw64 & 0xFFFFFFFF),
+            "crc32": int((raw64 >> 32) & 0xFFFFFFFF),
+        }
+
     def probe(self) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -85,6 +94,26 @@ class MockCPCSClient(CPCSClient):
     def __init__(self, mode: str = "noop"):
         self.mode = str(mode)
         self._programs: Dict[str, int] = {}
+        # device-faithful simulation state for the A1W kv_flow path:
+        # MRS registry + per-namespace byte stores (slm_write/slm_read and
+        # MR-window execute output land here, like device memory would).
+        self._mrs: Dict[int, List[Dict[str, int]]] = {}
+        self._next_rsid = 0
+        self._ns_store: Dict[int, bytearray] = {}
+
+    def _ns_write(self, nsid: int, offset: int, payload: bytes) -> None:
+        buf = self._ns_store.setdefault(int(nsid), bytearray())
+        end = offset + len(payload)
+        if len(buf) < end:
+            buf.extend(bytes(end - len(buf)))
+        buf[offset:end] = payload
+
+    def _ns_read(self, nsid: int, offset: int, length: int) -> bytes:
+        buf = self._ns_store.get(int(nsid), bytearray())
+        out = bytes(buf[offset:offset + length])
+        if len(out) < length:
+            out += bytes(length - len(out))
+        return out
 
     def probe(self) -> Dict[str, Any]:
         return {"status": "ok", "client": "mock", "mode": self.mode}
@@ -93,8 +122,14 @@ class MockCPCSClient(CPCSClient):
         return self.probe()
 
     def create_mrs(self, slm_nsid: int, ranges: List[Dict[str, int]], **kwargs: Any) -> int:
-        _ = (slm_nsid, ranges, kwargs)
-        return 1
+        _ = kwargs
+        self._next_rsid += 1
+        self._mrs[self._next_rsid] = [
+            {"nsid": int(r.get("nsid", slm_nsid) or slm_nsid),
+             "starting_byte": int(r.get("starting_byte", r.get("offset", 0))),
+             "length": int(r.get("length", r.get("length_bytes", 0)))}
+            for r in ranges]
+        return self._next_rsid
 
     def load_program(
         self,
@@ -170,6 +205,45 @@ class MockCPCSClient(CPCSClient):
         output = payload
         extra: Dict[str, Any] = {}
 
+        req_extra = kwargs.get("extra") or {}
+        if isinstance(req_extra, dict) and int(req_extra.get("output_mr_id", 0) or 0) > 0:
+            from . import kv_kernels
+            kmode = mode if mode in ("lossless_compress", "int8_quantize",
+                                     "layout", "noop") else "noop"
+            block = int(req_extra.get("layout_block_size_bytes",
+                                      kv_kernels.DEFAULT_BLOCK_SIZE) or
+                        kv_kernels.DEFAULT_BLOCK_SIZE)
+            if op == "unpack_load":
+                output = kv_kernels.decode(kmode, payload)
+            elif op == "layout_repack":
+                output = (kv_kernels.layout_decode(payload)
+                          if payload[:4] == kv_kernels.MAGIC_LAYOUT
+                          else kv_kernels.layout_encode(payload, block))
+            else:
+                output = (kv_kernels.encode(kmode, payload, block)
+                          if kmode == "layout" else
+                          kv_kernels.encode(kmode, payload))
+            mr_id = int(req_extra["output_mr_id"])
+            out_off = int(req_extra.get("output_offset", 0) or 0)
+            out_cap = int(req_extra.get("output_length", 0) or 0)
+            if out_cap and len(output) > out_cap:
+                raise RuntimeError("mock execute: output exceeds output_length")
+            ranges = self._mrs.get(int(rsid)) or []
+            if mr_id > len(ranges):
+                raise RuntimeError(f"mock execute: mr_id {mr_id} not in RSID {rsid}")
+            mr = ranges[mr_id - 1]
+            self._ns_write(mr["nsid"], mr["starting_byte"] + out_off, output)
+            elapsed = time.perf_counter() - t0
+            bits = self._split_result_value(
+                ((zlib.crc32(output) & 0xFFFFFFFF) << 32) | (len(output) & 0xFFFFFFFF))
+            extra.update({"result_raw": bits["raw"], "result_value": bits["value"],
+                          "result_crc32": bits["crc32"], "kv_flow_sim": True})
+            return CPCSResult(status="ok", output_offset=out_off,
+                              output_length=len(output), bytes_in=len(payload),
+                              bytes_out=len(output),
+                              device_compute_us=int(elapsed * 1e6),
+                              command_latency_s=elapsed, extra=extra)
+
         if op in ("pack_store", "execute"):
             if mode == "lossless_compress":
                 output = zlib.compress(payload, level=1)
@@ -206,7 +280,8 @@ class MockCPCSClient(CPCSClient):
         )
 
     def slm_write(self, *, slm_nsid: int, offset_bytes: int, payload: bytes, **kwargs: Any) -> CPCSResult:
-        _ = (slm_nsid, offset_bytes, kwargs)
+        _ = kwargs
+        self._ns_write(int(slm_nsid), int(offset_bytes), bytes(payload))
         return CPCSResult(
             status="ok",
             output_offset=int(offset_bytes),
@@ -235,8 +310,9 @@ class MockCPCSClient(CPCSClient):
         )
 
     def slm_read(self, *, slm_nsid: int, offset_bytes: int, length_bytes: int, **kwargs: Any) -> bytes:
-        _ = (slm_nsid, offset_bytes, kwargs)
-        return bytes(int(max(0, length_bytes)))
+        _ = kwargs
+        return self._ns_read(int(slm_nsid), int(offset_bytes),
+                             int(max(0, length_bytes)))
 
 
 class SpdkRpcBootstrap:
@@ -563,7 +639,8 @@ class SpdkPassthruCPCSClient(CPCSClient):
         for item in ranges:
             start = int(item.get("starting_byte", item.get("offset", 0)))
             length = int(item.get("length", item.get("length_bytes", 0)))
-            payload.extend(int(slm_nsid).to_bytes(4, byteorder="little", signed=False))
+            range_nsid = int(item.get("nsid", slm_nsid) or slm_nsid)
+            payload.extend(int(range_nsid).to_bytes(4, byteorder="little", signed=False))
             payload.extend(int(length).to_bytes(4, byteorder="little", signed=False))
             payload.extend(int(start).to_bytes(8, byteorder="little", signed=False))
             payload.extend(bytes(16))

@@ -355,6 +355,32 @@ def main():
                         help='CPCS client transport.')
     parser.add_argument('--cpcs-storage-mode', type=str, default='file', choices=['file', 'arena'],
                         help='CPCS storage layout mode for persisted payloads.')
+    parser.add_argument('--kv-flow', type=str, default='',
+                        choices=['', 'hostnvm', 'pslm', 'vslm'],
+                        help='A1W offload flow: hostnvm = host transform + NVMe write to the '
+                             'NVM kvstore ns; pslm = CPCS execute with output in the bounded '
+                             'pSLM ns + host copy-out to NVM; vslm = CPCS execute with output '
+                             'in the vSLM arena (eager publish persists device-side). '
+                             'Empty = legacy behavior.')
+    parser.add_argument('--kv-nvm-nsid', type=int, default=2,
+                        help='NVM kvstore namespace id for hostnvm/pslm persistence.')
+    parser.add_argument('--kv-pslm-nsid', type=int, default=101,
+                        help='Bounded physical-SLM namespace id (pslm flow scratch).')
+    parser.add_argument('--kv-exec-max-bytes', type=int, default=2 * 1024 * 1024,
+                        help='Max inline Execute payload per command; larger blocks chunk.')
+    parser.add_argument('--kv-vslm-arena-mb', type=int, default=1024,
+                        help='vSLM arena region size (MRS range 2 on the vSLM ns).')
+    parser.add_argument('--kv-scratch-mb', type=int, default=64,
+                        help='Decode/transform scratch region size (MRS range 1).')
+    parser.add_argument('--kv-pslm-mr-mb', type=int, default=64,
+                        help='pSLM scratch MRS range size; blocks beyond it chunk (the '
+                             'capacity axis for layout_repack).')
+    parser.add_argument('--cpcs-execute-output-enable', action='store_true', default=True,
+                        help='Enable MR-window execute output read-back (kv flows need it).')
+    parser.add_argument('--cpcs-execute-output-mr-id', type=int, default=1,
+                        help='1-based MRS range index for execute output (legacy paths).')
+    parser.add_argument('--cpcs-execute-output-offset-bytes', type=int, default=0)
+    parser.add_argument('--cpcs-execute-output-max-bytes', type=int, default=0)
     parser.add_argument('--spdk-inventory', type=str, default='',
                         help='Optional SPDK inventory YAML for passthru defaults.')
     parser.add_argument('--spdk-rpc-script', type=str, default='scripts/rpc.py',
@@ -712,6 +738,17 @@ def main():
         'block_size_kb': args.cpcs_block_size_kb,
         'batch_size': args.cpcs_batch_size,
         'fallback_on_error': args.cpcs_fallback_on_error,
+        'kv_flow': args.kv_flow,
+        'nvm_nsid': args.kv_nvm_nsid,
+        'pslm_nsid': args.kv_pslm_nsid,
+        'kv_exec_max_bytes': args.kv_exec_max_bytes,
+        'kv_vslm_arena_mb': args.kv_vslm_arena_mb,
+        'kv_scratch_mb': args.kv_scratch_mb,
+        'kv_pslm_mr_mb': args.kv_pslm_mr_mb,
+        'execute_output_enable': args.cpcs_execute_output_enable,
+        'execute_output_mr_id': args.cpcs_execute_output_mr_id,
+        'execute_output_offset_bytes': args.cpcs_execute_output_offset_bytes,
+        'execute_output_max_bytes': args.cpcs_execute_output_max_bytes,
     }
 
     benchmark = IntegratedBenchmark(
@@ -767,6 +804,7 @@ def main():
         'mode': args.cpcs_mode,
         'client': args.cpcs_client,
         'storage_mode': args.cpcs_storage_mode,
+        'kv_flow': args.kv_flow,
         'spdk_inventory': args.spdk_inventory,
         'bootstrap': {
             'enabled': (

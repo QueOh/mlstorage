@@ -136,6 +136,22 @@ class CPCSNVMeBackend(StorageBackend):
         self.cpcs_pind_by_op = self._build_pind_map(config)
         self.cpcs_rsid_by_op = self._build_rsid_map(config)
 
+        self.kv_flow = str(config.get("kv_flow", "") or "").strip().lower()
+        if self.kv_flow not in ("", "hostnvm", "pslm", "vslm"):
+            raise ValueError(f"Unsupported kv_flow: {self.kv_flow}")
+        self.nvm_nsid = int(config.get("nvm_nsid", 2) or 2)
+        self.pslm_nsid = int(config.get("pslm_nsid", 101) or 101)
+        self.kv_exec_max_bytes = int(config.get("kv_exec_max_bytes", 2 << 20) or (2 << 20))
+        self.kv_vslm_arena_bytes = int(config.get("kv_vslm_arena_mb", 1024) or 1024) * 1024 * 1024
+        self.kv_scratch_bytes = int(config.get("kv_scratch_mb", 64) or 64) * 1024 * 1024
+        self.kv_pslm_mr_bytes = int(config.get("kv_pslm_mr_mb", 64) or 64) * 1024 * 1024
+        self._nvm_next_offset = 0
+        self._vslm_arena_next = 0
+        self._flow_rsid = 0
+        self._flow_ranges: List[Dict[str, int]] = []
+        if self.kv_flow in ("pslm", "vslm"):
+            self._flow_bootstrap_mrs()
+
         self._verify_counter = 0
         self._initialize_storage_layout(config)
 
@@ -896,6 +912,271 @@ class CPCSNVMeBackend(StorageBackend):
         )
         self._persist_metrics_output()
 
+    # ------------------------------------------------------------------ A1W
+    # kv_flow arms (2026-08-06): hostnvm / pslm / vslm. All three end with
+    # the packed block durable in device storage; they differ in WHERE the
+    # transform runs and WHO moves the result:
+    #   hostnvm: host kernel (kv_kernels) burns initiator CPU, one NVMe
+    #            WRITE per chunk to the NVM kvstore ns (nvm_nsid).
+    #   pslm:    inline Execute per chunk with output into the BOUNDED
+    #            pSLM scratch MRS range (chunk cap = kv_pslm_mr_bytes --
+    #            the capacity axis), host reads the output back and writes
+    #            it to the NVM kvstore ns (host-mediated copy-out, charged).
+    #   vslm:    inline Execute per chunk with output into the vSLM arena
+    #            MRS range; eager publish writes through to the backing ns
+    #            at command completion -- no host copy-out.
+    # MRS layout (built by _flow_bootstrap_mrs): range 1 = decode/transform
+    # scratch, range 2 (vslm only) = arena. Execute output targeting uses
+    # extra {output_mr_id, output_offset, output_length}; the device packs
+    # out_len in CQE DW0 and crc32 in DW1 (checked on every read-back).
+
+    def _flow_bootstrap_mrs(self) -> None:
+        if self.kv_flow == "vslm":
+            ranges = [
+                {"nsid": self.slm_nsid, "starting_byte": 0,
+                 "length": self.kv_scratch_bytes},
+                {"nsid": self.slm_nsid, "starting_byte": self.kv_scratch_bytes,
+                 "length": self.kv_vslm_arena_bytes},
+            ]
+        else:  # pslm
+            ranges = [
+                {"nsid": self.pslm_nsid, "starting_byte": 0,
+                 "length": self.kv_pslm_mr_bytes},
+            ]
+        rsid = self.client.create_mrs(self.slm_nsid, ranges,
+                                      cpcs_nsid=self.cpcs_nsid)
+        self._flow_rsid = int(max(1, rsid))
+        self._flow_ranges = ranges
+        self.bootstrap_status["kv_flow_mrs"] = {
+            "flow": self.kv_flow, "rsid": self._flow_rsid, "ranges": ranges,
+        }
+
+    def _flow_chunk_bytes(self) -> int:
+        cap = int(self.kv_exec_max_bytes)
+        if self.kv_flow == "pslm":
+            cap = min(cap, self.kv_pslm_mr_bytes)
+        return max(cap, self.slm_rw_lba_bytes)
+
+    def _flow_alloc(self, length: int) -> int:
+        """Bump-allocate in the flow's persistent store; returns the store
+        offset (namespace-absolute for nvm, arena-RELATIVE for vslm)."""
+        align = max(1, int(self.slm_rw_lba_bytes))
+        if self.kv_flow == "vslm":
+            off = self._align_up(self._vslm_arena_next, align)
+            self._vslm_arena_next = off + length
+            if self._vslm_arena_next > self.kv_vslm_arena_bytes:
+                raise RuntimeError("vSLM arena exhausted -- raise --kv-vslm-arena-mb")
+            return off
+        off = self._align_up(self._nvm_next_offset, align)
+        self._nvm_next_offset = off + length
+        return off
+
+    def _flow_kernel_mode(self) -> str:
+        return self.mode if self.mode in ("lossless_compress", "int8_quantize",
+                                          "layout", "noop") else "noop"
+
+    def _flow_execute_chunk(self, op: str, chunk: bytes, out_mr_id: int,
+                            out_rel_off: int, out_cap: int,
+                            metrics_mode: str) -> Dict[str, Any]:
+        """One inline Execute with MR-window output; returns
+        {out_len, crc, latency_s}. Raises on device error/truncation."""
+        extra = {"output_mr_id": int(out_mr_id),
+                 "output_offset": int(out_rel_off),
+                 "output_length": int(out_cap),
+                 "kv_flow": self.kv_flow}
+        if self.mode == "layout":
+            extra["layout_block_size_bytes"] = int(min(self.block_size_bytes,
+                                                       1024 * 1024))
+        rsid, pind = self._flow_rsid, self._resolve_program_binding(op)[1]
+        result = self.client.execute(
+            cpcs_nsid=self.cpcs_nsid, rsid=rsid, pind=pind, payload=chunk,
+            op=op, mode=self.mode, extra=extra)
+        self._record_metrics(result, metrics_mode)
+        raw = int(result.extra.get("result_raw", result.extra.get("result_dw0", 0)) or 0)
+        out_len = int(result.extra.get("result_value", raw & 0xFFFFFFFF) or 0)
+        crc = int(result.extra.get("result_crc32", (raw >> 32) & 0xFFFFFFFF) or 0)
+        if out_len <= 0 or out_len > out_cap:
+            raise RuntimeError(
+                f"kv_flow execute bad out_len={out_len} (cap {out_cap}, op {op})")
+        return {"out_len": out_len, "crc": crc,
+                "latency_s": float(result.command_latency_s)}
+
+    def _flow_store_read(self, nsid: int, offset: int, length: int,
+                         metrics_mode: str) -> bytes:
+        aligned_off = (offset // self.slm_rw_lba_bytes) * self.slm_rw_lba_bytes
+        pre = offset - aligned_off
+        aligned_len = self._align_up(pre + length, self.slm_rw_lba_bytes)
+        t0 = time.perf_counter()
+        raw = self.client.slm_read(
+            slm_nsid=nsid, offset_bytes=aligned_off, length_bytes=aligned_len,
+            address_mode="lba", lba_bytes=self.slm_rw_lba_bytes)
+        self._record_slm_read_metrics(metrics_mode, aligned_len,
+                                      time.perf_counter() - t0)
+        return raw[pre:pre + length]
+
+    def _flow_store_write(self, nsid: int, offset: int, payload: bytes,
+                          metrics_mode: str) -> float:
+        dev = 0.0
+        cap = self._flow_chunk_bytes()
+        for off in range(0, len(payload), cap):
+            piece = payload[off:off + cap]
+            result = self.client.slm_write(
+                slm_nsid=nsid, offset_bytes=offset + off, payload=piece,
+                address_mode="lba", lba_bytes=self.slm_rw_lba_bytes)
+            self._record_metrics(result, metrics_mode)
+            dev += float(result.command_latency_s)
+        return dev
+
+    def _flow_write(self, key: str, data: np.ndarray) -> StorageBackend.IOTiming:
+        from . import kv_kernels
+        start = time.perf_counter()
+        # RAW tensor bytes, not the .npy container: the device kernels treat
+        # the payload as an f32 stream, and a lossy transform must not chew
+        # a serialization header. shape/dtype travel in the metadata.
+        raw_payload = np.ascontiguousarray(data).tobytes()
+        post_serialize = time.perf_counter()
+        kmode = self._flow_kernel_mode()
+        device_time = 0.0
+        host_kernel_s = 0.0
+        chunks: List[Dict[str, Any]] = []
+        cap = self._flow_chunk_bytes()
+        profile = self._command_profile(
+            phase="write", key=key, mode=self.mode,
+            payload_bytes=len(raw_payload), shape=tuple(data.shape),
+            dtype=data.dtype.str)
+        op = str(profile["op"])
+        mmode = str(profile["metrics_mode"]) + f"_{self.kv_flow}"
+
+        if self.kv_flow == "hostnvm":
+            t0 = time.perf_counter()
+            pieces = [kv_kernels.encode(kmode, raw_payload[o:o + cap],
+                                        min(self.block_size_bytes, 1024 * 1024))
+                      if kmode == "layout" else
+                      kv_kernels.encode(kmode, raw_payload[o:o + cap])
+                      for o in range(0, len(raw_payload), cap)]
+            host_kernel_s = time.perf_counter() - t0
+            pos = 0
+            store_parts = []
+            for piece, o in zip(pieces, range(0, len(raw_payload), cap)):
+                chunks.append({"packed_len": len(piece), "rel_off": pos,
+                               "raw_len": len(raw_payload[o:o + cap])})
+                store_parts.append(piece)
+                pos += len(piece)
+            packed_all = b"".join(store_parts)
+            store_off = self._flow_alloc(len(packed_all))
+            device_time += self._flow_store_write(self.nvm_nsid, store_off,
+                                                  packed_all, mmode)
+            store_nsid = self.nvm_nsid
+        else:
+            out_mr = 2 if self.kv_flow == "vslm" else 1
+            store_parts = []
+            arena_chunks = []
+            for o in range(0, len(raw_payload), cap):
+                chunk = raw_payload[o:o + cap]
+                if self.kv_flow == "vslm":
+                    rel = self._flow_alloc(len(chunk) + 4096)
+                    out_cap = len(chunk) + 4096
+                else:
+                    rel = 0
+                    out_cap = min(self.kv_pslm_mr_bytes, len(chunk) + 4096)
+                r = self._flow_execute_chunk(op, chunk, out_mr, rel, out_cap, mmode)
+                device_time += r["latency_s"]
+                if self.kv_flow == "pslm":
+                    packed = self._flow_store_read(self.pslm_nsid, rel,
+                                                   r["out_len"], mmode)
+                    if (zlib.crc32(packed) & 0xFFFFFFFF) != r["crc"] and r["crc"]:
+                        raise RuntimeError("kv_flow pslm read-back crc mismatch")
+                    store_parts.append(packed)
+                    chunks.append({"packed_len": r["out_len"],
+                                   "raw_len": len(chunk), "crc": r["crc"]})
+                else:
+                    arena_chunks.append({"rel_off": rel,
+                                         "packed_len": r["out_len"],
+                                         "raw_len": len(chunk),
+                                         "crc": r["crc"]})
+            if self.kv_flow == "pslm":
+                packed_all = b"".join(store_parts)
+                store_off = self._flow_alloc(len(packed_all))
+                pos = 0
+                for c in chunks:
+                    c["rel_off"] = pos
+                    pos += c["packed_len"]
+                device_time += self._flow_store_write(self.nvm_nsid, store_off,
+                                                      packed_all, mmode)
+                store_nsid = self.nvm_nsid
+            else:
+                chunks = arena_chunks
+                store_off = 0  # per-chunk rel offsets are authoritative
+                store_nsid = self.slm_nsid
+
+        checksum = int(zlib.crc32(raw_payload) & 0xFFFFFFFF)
+        meta = {
+            "shape": list(data.shape), "dtype": data.dtype.str,
+            "mode": self.mode, "kv_flow": self.kv_flow,
+            "raw_size": len(raw_payload), "checksum": checksum,
+            "store_nsid": store_nsid, "store_off": store_off,
+            "chunk_bytes": cap, "chunks": chunks,
+            "packed_size": sum(c["packed_len"] for c in chunks),
+            "storage_mode": "kv_flow",
+        }
+        self.metadata[key] = meta
+        self._meta_path(key).write_text(json.dumps(meta), encoding="utf-8")
+        end = time.perf_counter()
+        host_time = (end - start) - device_time
+        return StorageBackend.IOTiming(total=end - start, device=device_time,
+                                       host=host_time)
+
+    def _flow_read(self, key: str) -> Tuple[np.ndarray, StorageBackend.IOTiming]:
+        from . import kv_kernels
+        start = time.perf_counter()
+        meta = self.metadata.get(key)
+        if meta is None:
+            mp = self._meta_path(key)
+            if not mp.exists():
+                raise KeyError(f"Key {key} not found in kv_flow store")
+            meta = json.loads(mp.read_text(encoding="utf-8"))
+            self.metadata[key] = meta
+        kmode = str(meta.get("mode", self.mode))
+        if kmode not in ("lossless_compress", "int8_quantize", "layout", "noop"):
+            kmode = "noop"
+        device_time = 0.0
+        out_parts: List[bytes] = []
+        mmode = f"{kmode}_read_{self.kv_flow}"
+        store_nsid = int(meta["store_nsid"])
+        store_off = int(meta.get("store_off", 0))
+        arena_base = self.kv_scratch_bytes  # vslm range-2 namespace offset
+
+        for c in meta["chunks"]:
+            if self.kv_flow == "vslm":
+                packed = self._flow_store_read(
+                    self.slm_nsid, arena_base + int(c["rel_off"]),
+                    int(c["packed_len"]), mmode)
+            else:
+                packed = self._flow_store_read(
+                    store_nsid, store_off + int(c["rel_off"]),
+                    int(c["packed_len"]), mmode)
+            if self.kv_flow == "hostnvm":
+                out_parts.append(kv_kernels.decode(kmode, packed))
+                continue
+            prof = self._command_profile(phase="read", key=key, mode=kmode,
+                                         payload_bytes=len(packed))
+            r = self._flow_execute_chunk(str(prof["op"]), packed, 1, 0,
+                                         int(c["raw_len"]) + 4096, mmode)
+            device_time += r["latency_s"]
+            scratch_nsid = self.pslm_nsid if self.kv_flow == "pslm" else self.slm_nsid
+            decoded = self._flow_store_read(scratch_nsid, 0, r["out_len"], mmode)
+            out_parts.append(decoded)
+        raw = b"".join(out_parts)
+        if kmode != "int8_quantize":
+            if (zlib.crc32(raw) & 0xFFFFFFFF) != int(meta.get("checksum", 0)):
+                raise IOError(f"kv_flow read checksum mismatch for {key}")
+        arr = np.frombuffer(raw, dtype=np.dtype(str(meta["dtype"])))
+        arr = arr.reshape([int(x) for x in meta["shape"]]).copy()
+        end = time.perf_counter()
+        return arr, StorageBackend.IOTiming(
+            total=end - start, device=device_time,
+            host=(end - start) - device_time)
+
     def _store_packed_payload(self, key: str, packed_payload: bytes, meta: Dict[str, Any]) -> float:
         """
         Persist packed payload to current storage layout.
@@ -1051,6 +1332,8 @@ class CPCSNVMeBackend(StorageBackend):
         return packed, meta, (t1 - t0)
 
     def write(self, key: str, data: np.ndarray) -> StorageBackend.IOTiming:
+        if self.kv_flow:
+            return self._flow_write(key, data)
         start = time.perf_counter()
         raw_payload = self._serialize_array(data)
         post_serialize = time.perf_counter()
@@ -1128,6 +1411,8 @@ class CPCSNVMeBackend(StorageBackend):
         return StorageBackend.IOTiming(total=total, device=device_time, host=host_time)
 
     def read(self, key: str) -> Tuple[np.ndarray, StorageBackend.IOTiming]:
+        if self.kv_flow:
+            return self._flow_read(key)
         start = time.perf_counter()
         packed_payload, meta, disk_time = self._load_packed_payload_and_meta(key)
         mode = str(meta.get("mode", self.mode))
