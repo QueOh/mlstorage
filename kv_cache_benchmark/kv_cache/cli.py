@@ -325,7 +325,7 @@ def main():
                         help='Set the logging level (default: INFO)')
     parser.add_argument('--model', type=str, default='llama3.1-8b',
                         help='The model configuration to use. Models are loaded from config.yaml.')
-    parser.add_argument('--num-users', type=int, default=100,
+    parser.add_argument('--num-users', type=int, default=16,
                         help='The number of concurrent users to simulate.')
     parser.add_argument('--duration', type=int, default=60,
                         help='The duration of the benchmark in seconds.')
