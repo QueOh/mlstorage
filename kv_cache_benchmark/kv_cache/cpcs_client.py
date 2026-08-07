@@ -9,6 +9,8 @@ This module provides:
 from __future__ import annotations
 
 import io
+import itertools
+import threading
 import json
 import re
 import struct
@@ -448,6 +450,14 @@ class SpdkPassthruCPCSClient(CPCSClient):
         self.src_addr = str(src_addr or "")
         self.src_svcid = str(src_svcid or "")
         self.passthru_lcores = str(passthru_lcores or "1")
+        # Full-core initiator (2026-08-07): a range/list here ("0-31" or
+        # "2,5,9") is expanded and assigned ROUND-ROBIN, one core per
+        # spawned spdk_nvme_passthru process -- the historical single
+        # value pinned every helper from every worker thread to the same
+        # lcore, serializing all fabric commands onto one initiator core.
+        self._lcore_pool = self._parse_lcores(self.passthru_lcores)
+        self._lcore_iter = itertools.cycle(self._lcore_pool)
+        self._lcore_lock = threading.Lock()
         self.dataset_nsid = int(dataset_nsid)
         self.direct_probe_offset = int(direct_probe_offset)
         self.direct_probe_length = int(direct_probe_length)
@@ -463,12 +473,30 @@ class SpdkPassthruCPCSClient(CPCSClient):
         if self.direct_probe_length <= 0:
             raise ValueError("direct_probe_length must be > 0")
 
+    @staticmethod
+    def _parse_lcores(spec: str) -> List[str]:
+        cores: List[str] = []
+        for part in str(spec).replace(" ", "").split(","):
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                if lo.isdigit() and hi.isdigit() and int(lo) <= int(hi):
+                    cores.extend(str(c) for c in range(int(lo), int(hi) + 1))
+                    continue
+            cores.append(part)
+        return cores or ["1"]
+
+    def _next_lcore(self) -> str:
+        with self._lcore_lock:
+            return next(self._lcore_iter)
+
     def _base_cmd(self, admin: bool) -> List[str]:
         mode = "--admin-cmd" if admin else "--io-cmd"
         cmd = [
             self.spdk_nvme_passthru,
             "--lcores",
-            self.passthru_lcores,
+            self._next_lcore(),
             "--disable-cpumask-locks",
             "--no-rpc-server",
             mode,
