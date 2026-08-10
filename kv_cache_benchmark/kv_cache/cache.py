@@ -422,6 +422,12 @@ class MultiTierCache:
 
                 with self.stats_lock:
                     self.stats['evictions'] += 1
+                    # Demotions write INTO to_tier: count those bytes in the
+                    # tier-write stat (previously only fresh allocations
+                    # counted, so demotion-only storage traffic was invisible
+                    # in tier_storage_kv_bytes_written).
+                    to_stats_name = 'storage' if to_tier == 'nvme' else to_tier
+                    self.stats[f'tier_{to_stats_name}_kv_bytes_written'] += size
                     if to_tier == 'cpu':
                         self.stats['offloads_cpu'] += 1
                     elif to_tier == 'nvme':

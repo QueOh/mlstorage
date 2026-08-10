@@ -147,6 +147,14 @@ class CPCSNVMeBackend(StorageBackend):
         self.kv_pslm_mr_bytes = int(config.get("kv_pslm_mr_mb", 64) or 64) * 1024 * 1024
         self._nvm_next_offset = 0
         self._vslm_arena_next = 0
+        # Extent reuse for the flow stores. Bump-only allocation exhausts
+        # ANY arena size under demote churn (each re-demotion of a block
+        # allocated fresh space); the cache calls delete(key) whenever an
+        # entry leaves a tier, so freed extents are recycled first-fit.
+        # No splitting: serving KV blocks are uniform enough that whole-
+        # extent reuse keeps fragmentation negligible.
+        self._flow_free = {"vslm": [], "nvm": []}   # pool -> [(off, len)]
+        self._flow_resv = {"vslm": {}, "nvm": {}}   # pool -> {off: len}
         self._flow_rsid = 0
         self._flow_ranges: List[Dict[str, int]] = []
         if self.kv_flow in ("pslm", "vslm"):
@@ -958,18 +966,55 @@ class CPCSNVMeBackend(StorageBackend):
         return max(cap, self.slm_rw_lba_bytes)
 
     def _flow_alloc(self, length: int) -> int:
-        """Bump-allocate in the flow's persistent store; returns the store
-        offset (namespace-absolute for nvm, arena-RELATIVE for vslm)."""
+        """Allocate in the flow's persistent store; returns the store
+        offset (namespace-absolute for nvm, arena-RELATIVE for vslm).
+        Reuses freed extents first (see _flow_reclaim), then bumps."""
         align = max(1, int(self.slm_rw_lba_bytes))
+        pool = "vslm" if self.kv_flow == "vslm" else "nvm"
+        free = self._flow_free[pool]
+        for i, (foff, flen) in enumerate(free):
+            if flen >= length:
+                del free[i]
+                self._flow_resv[pool][foff] = flen
+                return foff
         if self.kv_flow == "vslm":
             off = self._align_up(self._vslm_arena_next, align)
             self._vslm_arena_next = off + length
             if self._vslm_arena_next > self.kv_vslm_arena_bytes:
-                raise RuntimeError("vSLM arena exhausted -- raise --kv-vslm-arena-mb")
+                self._vslm_arena_next = off  # roll back the failed bump
+                raise RuntimeError(
+                    "vSLM arena exhausted -- raise --kv-vslm-arena-mb "
+                    f"(want={length} next={off} cap={self.kv_vslm_arena_bytes} "
+                    f"free_extents={len(free)} "
+                    f"free_bytes={sum(l for _, l in free)})")
+            self._flow_resv[pool][off] = length
             return off
         off = self._align_up(self._nvm_next_offset, align)
         self._nvm_next_offset = off + length
+        self._flow_resv[pool][off] = length
         return off
+
+    def _flow_reclaim(self, key: str) -> None:
+        """Return a deleted/overwritten key's flow extents to the free list.
+        Reserved lengths come from _flow_resv (whole-extent reuse), falling
+        back to the meta-recorded sizes for extents from earlier runs."""
+        if not self.kv_flow:
+            return
+        meta = self.metadata.get(key)
+        if not isinstance(meta, dict) or meta.get("storage_mode") != "kv_flow":
+            return
+        if meta.get("kv_flow") == "vslm":
+            free, resv = self._flow_free["vslm"], self._flow_resv["vslm"]
+            for c in meta.get("chunks", []):
+                off = c.get("rel_off")
+                if isinstance(off, int):
+                    free.append((off, resv.pop(
+                        off, int(c.get("raw_len", 0)) + 4096)))
+        else:
+            off = meta.get("store_off")
+            if isinstance(off, int):
+                self._flow_free["nvm"].append((off, self._flow_resv["nvm"].pop(
+                    off, int(meta.get("packed_size", 0)))))
 
     def _flow_kernel_mode(self) -> str:
         return self.mode if self.mode in ("lossless_compress", "int8_quantize",
@@ -1028,7 +1073,26 @@ class CPCSNVMeBackend(StorageBackend):
         return dev
 
     def _flow_write(self, key: str, data: np.ndarray) -> StorageBackend.IOTiming:
+        """Leak guard: a write that dies mid-key (device error, arena
+        exhaustion on a later chunk) has no metadata yet, so its already-
+        allocated extents would be unreclaimable -- under exhaustion
+        pressure every failed write then leaks, a death spiral. Track this
+        call's allocations and return them to the free list on failure."""
+        allocs: List[int] = []
+        try:
+            return self._flow_write_inner(key, data, allocs)
+        except Exception:
+            pool = "vslm" if self.kv_flow == "vslm" else "nvm"
+            free, resv = self._flow_free[pool], self._flow_resv[pool]
+            for off in allocs:
+                if off in resv:
+                    free.append((off, resv.pop(off)))
+            raise
+
+    def _flow_write_inner(self, key: str, data: np.ndarray,
+                          allocs: List[int]) -> StorageBackend.IOTiming:
         from . import kv_kernels
+        self._flow_reclaim(key)  # overwrite: recycle the old extents
         start = time.perf_counter()
         # RAW tensor bytes, not the .npy container: the device kernels treat
         # the payload as an f32 stream, and a lossy transform must not chew
@@ -1064,6 +1128,7 @@ class CPCSNVMeBackend(StorageBackend):
                 pos += len(piece)
             packed_all = b"".join(store_parts)
             store_off = self._flow_alloc(len(packed_all))
+            allocs.append(store_off)
             device_time += self._flow_store_write(self.nvm_nsid, store_off,
                                                   packed_all, mmode)
             store_nsid = self.nvm_nsid
@@ -1075,6 +1140,7 @@ class CPCSNVMeBackend(StorageBackend):
                 chunk = raw_payload[o:o + cap]
                 if self.kv_flow == "vslm":
                     rel = self._flow_alloc(len(chunk) + 4096)
+                    allocs.append(rel)
                     out_cap = len(chunk) + 4096
                 else:
                     rel = 0
@@ -1097,6 +1163,7 @@ class CPCSNVMeBackend(StorageBackend):
             if self.kv_flow == "pslm":
                 packed_all = b"".join(store_parts)
                 store_off = self._flow_alloc(len(packed_all))
+                allocs.append(store_off)
                 pos = 0
                 for c in chunks:
                     c["rel_off"] = pos
@@ -1120,6 +1187,7 @@ class CPCSNVMeBackend(StorageBackend):
             "storage_mode": "kv_flow",
         }
         self.metadata[key] = meta
+        allocs.clear()  # committed to metadata -- no longer abortable
         self._meta_path(key).write_text(json.dumps(meta), encoding="utf-8")
         end = time.perf_counter()
         host_time = (end - start) - device_time
@@ -1484,6 +1552,7 @@ class CPCSNVMeBackend(StorageBackend):
         return out
 
     def delete(self, key: str):
+        self._flow_reclaim(key)
         if self.storage_mode == "file":
             self._path(key).unlink(missing_ok=True)
             self._meta_path(key).unlink(missing_ok=True)
