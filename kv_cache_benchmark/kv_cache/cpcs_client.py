@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import itertools
+import os
 import threading
 import json
 import re
@@ -497,6 +498,15 @@ class SpdkPassthruCPCSClient(CPCSClient):
             self.spdk_nvme_passthru,
             "--lcores",
             self._next_lcore(),
+            # Bound each helper's hugepage reservation (SPDK app framework
+            # -s, in MB). Without it, concurrent per-command helpers across
+            # the lcore pool take the default reservation each and can
+            # transiently drain the initiator pool -- the 2026-08-10 A1
+            # "No free 2048 kB hugepages" env-init failure class. 128 MB
+            # is generous for <=2 MiB payloads; 32 concurrent helpers cap
+            # at 4 GiB total.
+            "-s",
+            os.environ.get("KVBENCH_PASSTHRU_MEM_MB", "128"),
             "--disable-cpumask-locks",
             "--no-rpc-server",
             mode,
