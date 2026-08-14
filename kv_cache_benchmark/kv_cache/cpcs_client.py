@@ -126,6 +126,16 @@ class MockCPCSClient(CPCSClient):
 
     def create_mrs(self, slm_nsid: int, ranges: List[Dict[str, int]], **kwargs: Any) -> int:
         _ = kwargs
+        for r in ranges:
+            length = int(r.get("length", r.get("length_bytes", 0)))
+            if not (0 < length <= 0xFFFFFFFF):
+                # Device-encoding parity with the Spdk client: per-range
+                # length is u32 on the wire. The mock must reject what the
+                # device would, or offline tests cannot catch it (the 4096
+                # MiB arena OverflowError shipped to the cluster this way).
+                raise ValueError(
+                    f"MRS range length {length} does not fit u32 "
+                    "(max 4294967295 = 4 GiB - 1); use <= 4095 MiB per range")
         self._next_rsid += 1
         self._mrs[self._next_rsid] = [
             {"nsid": int(r.get("nsid", slm_nsid) or slm_nsid),
@@ -678,6 +688,15 @@ class SpdkPassthruCPCSClient(CPCSClient):
             start = int(item.get("starting_byte", item.get("offset", 0)))
             length = int(item.get("length", item.get("length_bytes", 0)))
             range_nsid = int(item.get("nsid", slm_nsid) or slm_nsid)
+            if not (0 < length <= 0xFFFFFFFF):
+                # The Create MRS encoding carries per-range length as u32:
+                # a single range is capped BELOW 4 GiB. A 4096 MiB arena is
+                # exactly 2^32 and died here as a bare OverflowError on the
+                # cluster (2026-08-13 A1 night) -- fail with the actionable
+                # message instead.
+                raise ValueError(
+                    f"MRS range length {length} does not fit u32 "
+                    "(max 4294967295 = 4 GiB - 1); use <= 4095 MiB per range")
             payload.extend(int(range_nsid).to_bytes(4, byteorder="little", signed=False))
             payload.extend(int(length).to_bytes(4, byteorder="little", signed=False))
             payload.extend(int(start).to_bytes(8, byteorder="little", signed=False))
