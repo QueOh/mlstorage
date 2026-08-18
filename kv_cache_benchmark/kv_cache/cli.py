@@ -897,6 +897,20 @@ def main():
 
     logger.info(f"Results saved to {args.output}")
 
+    # A silent-death run must not exit 0 (2026-08-16 A1 night: every cell
+    # lost with rc=0 / zero requests / zero evidence). Surface the first
+    # captured thread traceback on stderr and fail the invocation.
+    _summary = results.get('summary') or {}
+    _terrs = _summary.get('thread_errors') or []
+    if _terrs:
+        print(f"THREAD ERRORS ({_summary.get('thread_error_count', len(_terrs))} total); first:",
+              file=sys.stderr)
+        print(_terrs[0], file=sys.stderr)
+    if int(_summary.get('total_requests', 0) or 0) == 0 and _terrs:
+        print("FATAL: zero requests completed and worker threads raised -- failing run",
+              file=sys.stderr)
+        sys.exit(3)
+
     if args.xlsx_output:
         export_results_to_xlsx(results, args, args.xlsx_output)
 

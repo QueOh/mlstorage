@@ -211,6 +211,21 @@ class IntegratedBenchmark:
         self.results_lock = threading.Lock()
         self.stop_event: Optional[threading.Event] = None
         self.rag_ingest_done = threading.Event() if self.enable_rag else None
+        # Worker/generator threads are daemons and Python thread deaths are
+        # SILENT -- the 2026-08-16 A1 night lost every cell with rc=0,
+        # requests_completed=0 and NOT ONE line of evidence (the driver
+        # discards stderr on rc=0). Capture every thread exception here;
+        # results carry the first few and the CLI exits nonzero on a
+        # zero-completed run that has errors.
+        self.thread_errors: List[str] = []
+        import traceback as _tb
+
+        def _thread_excepthook(args, _self=self, _tb=_tb):
+            msg = "".join(_tb.format_exception(
+                args.exc_type, args.exc_value, args.exc_traceback))
+            with _self.results_lock:
+                _self.thread_errors.append(msg[-2000:])
+        threading.excepthook = _thread_excepthook
 
     def _ingest_rag_documents(self, num_docs: int, stop_event: Optional[threading.Event] = None):
         """Ingests RAG documents for the workload."""
@@ -1467,6 +1482,8 @@ class IntegratedBenchmark:
 
         summary = {
             'total_requests': self.results['requests_completed'],
+            'thread_errors': list(self.thread_errors[:3]),
+            'thread_error_count': len(self.thread_errors),
             'total_tokens': self.results['total_tokens_generated'],
             'elapsed_time': duration,
             'avg_throughput_tokens_per_sec': self.results['total_tokens_generated'] / duration,
