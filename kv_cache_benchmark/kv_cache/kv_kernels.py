@@ -123,6 +123,14 @@ def quant_i8_encode(payload: bytes) -> bytes:
     v = np.frombuffer(payload, dtype="<f4")
     if v.size > 0xFFFFFFFF:
         raise ValueError("payload too large for KVQ1")
+    # The KVQ1 contract reinterprets RAW bytes as an f32 stream; FP16 KV
+    # state reinterpreted this way yields arbitrary bit patterns including
+    # NaN/inf, which produced RuntimeWarnings and nondeterministic int8
+    # casts (08-18 A1 night). Sanitize non-finite lanes to 0.0 so the host
+    # reference is deterministic; quantize equality claims apply to the
+    # sanitized stream (documented in analysis_guide_a1.md).
+    if not np.all(np.isfinite(v)):
+        v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
     max_abs = np.float32(np.max(np.abs(v))) if v.size else np.float32(0.0)
     scale = np.float32(max_abs / np.float32(127.0)) if max_abs > 0 else np.float32(1.0)
     r32 = (v / scale).astype(np.float32)

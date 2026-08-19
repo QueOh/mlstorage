@@ -1484,6 +1484,10 @@ class IntegratedBenchmark:
             'total_requests': self.results['requests_completed'],
             'thread_errors': list(self.thread_errors[:3]),
             'thread_error_count': len(self.thread_errors),
+            'allocation_failures': int(
+                self.cache.stats.get('allocation_failures', 0)
+                if hasattr(self, 'cache') and hasattr(self.cache, 'stats')
+                else 0),
             'total_tokens': self.results['total_tokens_generated'],
             'elapsed_time': duration,
             'avg_throughput_tokens_per_sec': self.results['total_tokens_generated'] / duration,

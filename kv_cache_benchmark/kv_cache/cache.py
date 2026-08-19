@@ -757,6 +757,21 @@ class MultiTierCache:
             return True, allocated_tier, timing.total
 
         except Exception as e:
+            # LOUD failure (08-18 A1 lesson: every pslm/vslm KV write raised
+            # here and was silently dropped -- requests completed with zero
+            # storage and the run reported success). Count + log the first
+            # few with tracebacks; they land in the always-persisted stderr.
+            with self.stats_lock:
+                self.stats['allocation_failures'] = \
+                    self.stats.get('allocation_failures', 0) + 1
+                nfail = self.stats['allocation_failures']
+            if nfail <= 5:
+                logger.error(
+                    "KV allocation write to tier %s FAILED for %s: %s",
+                    allocated_tier, key, e, exc_info=True)
+            elif nfail == 6:
+                logger.error("further allocation failures suppressed "
+                             "(count in summary.allocation_failures)")
             with self.memory_lock:
                 self._update_tier_usage(allocated_tier, -size_bytes)
             del data

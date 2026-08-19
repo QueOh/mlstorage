@@ -1608,5 +1608,9 @@ class CPCSNVMeBackend(StorageBackend):
             self.client.close()
         except Exception:
             pass
-        if self.temp_dir:
-            self.temp_dir.cleanup()
+        try:
+            td = getattr(self, "temp_dir", None)
+            if td is not None:
+                td.cleanup()
+        except Exception:
+            pass  # partially-constructed backend (08-18 __del__ traceback)
