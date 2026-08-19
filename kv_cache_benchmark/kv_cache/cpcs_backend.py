@@ -1046,12 +1046,30 @@ class CPCSNVMeBackend(StorageBackend):
         return {"out_len": out_len, "crc": crc,
                 "latency_s": float(result.command_latency_s)}
 
+    def _flow_addr_mode(self, nsid: int) -> str:
+        """SLM namespaces (vSLM 100 / pSLM 101) are CSI-3, BYTE-addressed:
+        LBA-addressed opcodes on them return INVALID FIELD or garbage --
+        the 08-19 VM finding that explained every pslm/vslm read failure
+        (the exec output was byte-perfect all along; only the read-back
+        addressing was wrong). The NVM kvstore stays LBA-addressed."""
+        if nsid in (int(self.slm_nsid), int(self.pslm_nsid)):
+            return "byte"
+        return "lba"
+
     def _flow_store_read(self, nsid: int, offset: int, length: int,
                          metrics_mode: str) -> bytes:
+        mode = self._flow_addr_mode(nsid)
+        t0 = time.perf_counter()
+        if mode == "byte":
+            raw = self.client.slm_read(
+                slm_nsid=nsid, offset_bytes=offset, length_bytes=length,
+                address_mode="byte")
+            self._record_slm_read_metrics(metrics_mode, length,
+                                          time.perf_counter() - t0)
+            return raw[:length]
         aligned_off = (offset // self.slm_rw_lba_bytes) * self.slm_rw_lba_bytes
         pre = offset - aligned_off
         aligned_len = self._align_up(pre + length, self.slm_rw_lba_bytes)
-        t0 = time.perf_counter()
         raw = self.client.slm_read(
             slm_nsid=nsid, offset_bytes=aligned_off, length_bytes=aligned_len,
             address_mode="lba", lba_bytes=self.slm_rw_lba_bytes)
@@ -1063,11 +1081,17 @@ class CPCSNVMeBackend(StorageBackend):
                           metrics_mode: str) -> float:
         dev = 0.0
         cap = self._flow_chunk_bytes()
+        mode = self._flow_addr_mode(nsid)
         for off in range(0, len(payload), cap):
             piece = payload[off:off + cap]
-            result = self.client.slm_write(
-                slm_nsid=nsid, offset_bytes=offset + off, payload=piece,
-                address_mode="lba", lba_bytes=self.slm_rw_lba_bytes)
+            if mode == "byte":
+                result = self.client.slm_write(
+                    slm_nsid=nsid, offset_bytes=offset + off, payload=piece,
+                    address_mode="byte")
+            else:
+                result = self.client.slm_write(
+                    slm_nsid=nsid, offset_bytes=offset + off, payload=piece,
+                    address_mode="lba", lba_bytes=self.slm_rw_lba_bytes)
             self._record_metrics(result, metrics_mode)
             dev += float(result.command_latency_s)
         return dev
