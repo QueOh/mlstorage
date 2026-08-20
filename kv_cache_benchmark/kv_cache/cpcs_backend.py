@@ -1022,13 +1022,18 @@ class CPCSNVMeBackend(StorageBackend):
 
     def _flow_execute_chunk(self, op: str, chunk: bytes, out_mr_id: int,
                             out_rel_off: int, out_cap: int,
-                            metrics_mode: str) -> Dict[str, Any]:
+                            metrics_mode: str, phase: str = "write") -> Dict[str, Any]:
         """One inline Execute with MR-window output; returns
-        {out_len, crc, latency_s}. Raises on device error/truncation."""
+        {out_len, crc, latency_s}. Raises on device error/truncation.
+        phase MUST be "read" on the decode direction: the device's
+        LAYOUT_REPACK dispatch selects decode by extra["phase"]=="read"
+        (not by container magic) -- without it the read path re-encodes
+        the container (the 08-20 VM checksum-mismatch finding)."""
         extra = {"output_mr_id": int(out_mr_id),
                  "output_offset": int(out_rel_off),
                  "output_length": int(out_cap),
-                 "kv_flow": self.kv_flow}
+                 "kv_flow": self.kv_flow,
+                 "phase": str(phase)}
         if self.mode == "layout":
             extra["layout_block_size_bytes"] = int(min(self.block_size_bytes,
                                                        1024 * 1024))
@@ -1162,6 +1167,8 @@ class CPCSNVMeBackend(StorageBackend):
             arena_chunks = []
             for o in range(0, len(raw_payload), cap):
                 chunk = raw_payload[o:o + cap]
+                # Device encoders raw-fallback when output >= input, so the
+                # result never exceeds the chunk; +4096 covers containers.
                 if self.kv_flow == "vslm":
                     rel = self._flow_alloc(len(chunk) + 4096)
                     allocs.append(rel)
@@ -1253,7 +1260,8 @@ class CPCSNVMeBackend(StorageBackend):
             prof = self._command_profile(phase="read", key=key, mode=kmode,
                                          payload_bytes=len(packed))
             r = self._flow_execute_chunk(str(prof["op"]), packed, 1, 0,
-                                         int(c["raw_len"]) + 4096, mmode)
+                                         int(c["raw_len"]) + 4096, mmode,
+                                         phase="read")
             device_time += r["latency_s"]
             scratch_nsid = self.pslm_nsid if self.kv_flow == "pslm" else self.slm_nsid
             decoded = self._flow_store_read(scratch_nsid, 0, r["out_len"], mmode)

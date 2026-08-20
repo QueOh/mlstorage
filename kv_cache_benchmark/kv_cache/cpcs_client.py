@@ -229,9 +229,16 @@ class MockCPCSClient(CPCSClient):
             if op == "unpack_load":
                 output = kv_kernels.decode(kmode, payload)
             elif op == "layout_repack":
-                output = (kv_kernels.layout_decode(payload)
-                          if payload[:4] == kv_kernels.MAGIC_LAYOUT
-                          else kv_kernels.layout_encode(payload, block))
+                # Device semantics (builtin_runtime dispatch): direction is
+                # selected by extra["phase"]=="read", NOT by container magic;
+                # decode of a magicless (raw-passthrough) chunk falls through
+                # to passthrough (the -ENOENT path).
+                if str(req_extra.get("phase", "")) == "read":
+                    output = (kv_kernels.layout_decode(payload)
+                              if payload[:4] == kv_kernels.MAGIC_LAYOUT
+                              else payload)
+                else:
+                    output = kv_kernels.layout_encode(payload, block)
             else:
                 output = (kv_kernels.encode(kmode, payload, block)
                           if kmode == "layout" else
