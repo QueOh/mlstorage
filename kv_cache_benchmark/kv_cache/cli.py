@@ -403,7 +403,8 @@ def main():
                         help='Comma-separated list of rpc.py methods required when bootstrap check is enabled.')
     parser.add_argument('--spdk-nvme-passthru', type=str, default='',
                         help='Path to spdk_nvme_passthru binary.')
-    parser.add_argument('--trtype', type=str, default='TCP', help='NVMe-oF transport type.')
+    parser.add_argument('--trtype', type=str, default='',
+                        help='NVMe-oF transport type (explicit flag > --spdk-inventory > TCP).')
     parser.add_argument('--traddr', type=str, default='', help='NVMe-oF transport address.')
     parser.add_argument('--trsvcid', type=str, default='', help='NVMe-oF transport service ID.')
     parser.add_argument('--subnqn', type=str, default='', help='NVMe-oF subsystem NQN.')
@@ -591,11 +592,11 @@ def main():
             if cur in empty_values and name in inventory_defaults:
                 setattr(args, name, inventory_defaults[name])
 
-        # 'TCP' is the built-in default, so it must count as "unset" here or
-        # the inventory's trtype can never apply -- the client then dials TCP
-        # at an RDMA-only target and gets connection refused (cluster 08-24;
-        # same overridable-default pattern as slm_read_address_mode below).
-        _apply_if_empty('trtype', {'TCP', '', None})
+        # Precedence: explicit --trtype > inventory > TCP fallback (below).
+        # The old 'TCP' argparse default blocked the inventory value here --
+        # the client then dialed TCP at an RDMA-only target and got
+        # connection refused (cluster 08-24).
+        _apply_if_empty('trtype', {'', None})
         _apply_if_empty('traddr', {'', None})
         _apply_if_empty('trsvcid', {'', None})
         _apply_if_empty('subnqn', {'', None})
@@ -643,6 +644,9 @@ def main():
         _apply_if_empty('cpcs_slm_rw_lba_bytes', {0, None})
         _apply_if_empty('cpcs_slm_read_address_mode', {'byte', '', None})
         _apply_if_empty('cpcs_slm_write_address_mode', {'lba', '', None})
+
+    if not args.trtype:
+        args.trtype = 'TCP'
 
     if args.config:
         config = ConfigLoader(args.config)
