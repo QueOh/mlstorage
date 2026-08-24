@@ -225,6 +225,10 @@ class IntegratedBenchmark:
                 args.exc_type, args.exc_value, args.exc_traceback))
             with _self.results_lock:
                 _self.thread_errors.append(msg[-2000:])
+            # Print at capture time too: the summary that carries these can
+            # be skipped entirely (zero-completion early return), and the
+            # 08-24 a1 smoke produced an evidence-free stderr log that way.
+            logger.error("worker thread died:\n%s", msg[-2000:])
         threading.excepthook = _thread_excepthook
 
     def _ingest_rag_documents(self, num_docs: int, stop_event: Optional[threading.Event] = None):
@@ -1453,6 +1457,25 @@ class IntegratedBenchmark:
         """Calculate final statistics with all feature breakdowns."""
         if not self.results['end_to_end_latencies']:
             logger.warning("No requests completed during benchmark!")
+            # A zero-completion run must still carry its evidence: this
+            # early return used to skip summary assembly entirely, so
+            # thread_errors/allocation_failures were dropped exactly on
+            # the runs that needed them (08-24 a1 smoke: all-None JSON).
+            # in_flight tells a hang (workers alive, no errors) apart
+            # from silent thread deaths (errors) and from never-started.
+            self.results['summary'] = {
+                'total_requests': 0,
+                'requests_completed': 0,
+                'thread_errors': list(self.thread_errors[:3]),
+                'thread_error_count': len(self.thread_errors),
+                'allocation_failures': int(
+                    self.cache.stats.get('allocation_failures', 0)
+                    if hasattr(self, 'cache') and hasattr(self.cache, 'stats')
+                    else 0),
+                'in_flight_worker_threads': sum(
+                    1 for t in threading.enumerate()
+                    if t.daemon and t is not threading.current_thread()),
+            }
             return
 
         duration = actual_duration if actual_duration else self.duration
