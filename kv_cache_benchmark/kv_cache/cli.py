@@ -591,7 +591,11 @@ def main():
             if cur in empty_values and name in inventory_defaults:
                 setattr(args, name, inventory_defaults[name])
 
-        _apply_if_empty('trtype', {'', None})
+        # 'TCP' is the built-in default, so it must count as "unset" here or
+        # the inventory's trtype can never apply -- the client then dials TCP
+        # at an RDMA-only target and gets connection refused (cluster 08-24;
+        # same overridable-default pattern as slm_read_address_mode below).
+        _apply_if_empty('trtype', {'TCP', '', None})
         _apply_if_empty('traddr', {'', None})
         _apply_if_empty('trsvcid', {'', None})
         _apply_if_empty('subnqn', {'', None})
