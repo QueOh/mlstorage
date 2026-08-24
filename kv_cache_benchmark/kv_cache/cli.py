@@ -319,6 +319,15 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
 
 def main():
     """Main entry point for running the benchmark from the command line."""
+    # Hang forensics (08-24): KVBENCH_STACKDUMP_SEC=N dumps every thread's
+    # stack to stderr every N seconds -- the driver persists stderr, so a
+    # hung worker names its stuck call in the .stderr.log even when the
+    # run ends with zero completions and zero exceptions.
+    _dump_sec = os.environ.get('KVBENCH_STACKDUMP_SEC', '').strip()
+    if _dump_sec:
+        import faulthandler
+        faulthandler.dump_traceback_later(
+            int(_dump_sec), repeat=True, exit=False)
     parser = argparse.ArgumentParser(description="Integrated Multi-User KV Cache Benchmark")
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
