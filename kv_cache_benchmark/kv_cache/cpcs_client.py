@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import itertools
+import logging
 import os
 import threading
 import json
@@ -18,6 +19,8 @@ import struct
 import subprocess
 import tempfile
 import time
+
+logger = logging.getLogger(__name__)
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -881,7 +884,27 @@ class SpdkPassthruCPCSClient(CPCSClient):
                 "--input-file",
                 path,
             ]
-            out = self._run_checked(cmd)
+            # Bounded retry on MEMORY_RANGE_SET_IN_USE (01/95): the firmware
+            # leases the whole RSID per execute, and although the backend
+            # serializes its own executes, a lease can outlive the command
+            # briefly (publish/writeback tail) or another process may hold
+            # it. Waiting out a transient conflict is honest; anything
+            # persistent still raises after the last attempt.
+            attempts = 0
+            while True:
+                try:
+                    out = self._run_checked(cmd)
+                    break
+                except RuntimeError as exc:
+                    txt = str(exc)
+                    if ("01/95" not in txt and "0x95" not in txt) or attempts >= 4:
+                        raise
+                    attempts += 1
+                    self.mrs_conflict_retries = getattr(
+                        self, "mrs_conflict_retries", 0) + 1
+                    logger.warning(
+                        "execute lease conflict (01/95), retry %d/4", attempts)
+                    time.sleep(0.05 * attempts)
             elapsed = time.perf_counter() - t0
             result_bits = self._split_result_value(self._parse_result_hex(out))
             return CPCSResult(

@@ -155,6 +155,20 @@ class CPCSNVMeBackend(StorageBackend):
         # extent reuse keeps fragmentation negligible.
         self._flow_free = {"vslm": [], "nvm": []}   # pool -> [(off, len)]
         self._flow_resv = {"vslm": {}, "nvm": {}}   # pool -> {off: len}
+        # Concurrency (08-24 cluster finding, VM-reproduced): serving runs
+        # this backend from MANY worker threads.
+        #  - _flow_alloc_lock: the free-list scan/del races unlocked --
+        #    two threads can claim the SAME extent (data corruption).
+        #  - _exec_lock: firmware 46795d731 leases EVERY resolved range of
+        #    the RSID in full per Execute (execute.c: acquire loop over
+        #    resolved_ranges), so concurrent executes on one MRS are
+        #    refused with MEMORY_RANGE_SET_IN_USE (01/95). Serialize
+        #    client-side: waiting is cheaper than a ~400 ms spawn that
+        #    gets rejected. Device exec parallelism per MRS is 1 BY
+        #    FIRMWARE DESIGN -- disclose, don't fight.
+        import threading as _threading
+        self._flow_alloc_lock = _threading.Lock()
+        self._exec_lock = _threading.Lock()
         self._flow_rsid = 0
         self._flow_ranges: List[Dict[str, int]] = []
         if self.kv_flow in ("pslm", "vslm"):
@@ -968,31 +982,34 @@ class CPCSNVMeBackend(StorageBackend):
     def _flow_alloc(self, length: int) -> int:
         """Allocate in the flow's persistent store; returns the store
         offset (namespace-absolute for nvm, arena-RELATIVE for vslm).
-        Reuses freed extents first (see _flow_reclaim), then bumps."""
+        Reuses freed extents first (see _flow_reclaim), then bumps.
+        Lock-guarded: the free-list scan/del raced under threaded serving
+        and could hand the SAME extent to two writers (08-24)."""
         align = max(1, int(self.slm_rw_lba_bytes))
         pool = "vslm" if self.kv_flow == "vslm" else "nvm"
-        free = self._flow_free[pool]
-        for i, (foff, flen) in enumerate(free):
-            if flen >= length:
-                del free[i]
-                self._flow_resv[pool][foff] = flen
-                return foff
-        if self.kv_flow == "vslm":
-            off = self._align_up(self._vslm_arena_next, align)
-            self._vslm_arena_next = off + length
-            if self._vslm_arena_next > self.kv_vslm_arena_bytes:
-                self._vslm_arena_next = off  # roll back the failed bump
-                raise RuntimeError(
-                    "vSLM arena exhausted -- raise --kv-vslm-arena-mb "
-                    f"(want={length} next={off} cap={self.kv_vslm_arena_bytes} "
-                    f"free_extents={len(free)} "
-                    f"free_bytes={sum(l for _, l in free)})")
+        with self._flow_alloc_lock:
+            free = self._flow_free[pool]
+            for i, (foff, flen) in enumerate(free):
+                if flen >= length:
+                    del free[i]
+                    self._flow_resv[pool][foff] = flen
+                    return foff
+            if self.kv_flow == "vslm":
+                off = self._align_up(self._vslm_arena_next, align)
+                self._vslm_arena_next = off + length
+                if self._vslm_arena_next > self.kv_vslm_arena_bytes:
+                    self._vslm_arena_next = off  # roll back the failed bump
+                    raise RuntimeError(
+                        "vSLM arena exhausted -- raise --kv-vslm-arena-mb "
+                        f"(want={length} next={off} cap={self.kv_vslm_arena_bytes} "
+                        f"free_extents={len(free)} "
+                        f"free_bytes={sum(l for _, l in free)})")
+                self._flow_resv[pool][off] = length
+                return off
+            off = self._align_up(self._nvm_next_offset, align)
+            self._nvm_next_offset = off + length
             self._flow_resv[pool][off] = length
             return off
-        off = self._align_up(self._nvm_next_offset, align)
-        self._nvm_next_offset = off + length
-        self._flow_resv[pool][off] = length
-        return off
 
     def _flow_reclaim(self, key: str) -> None:
         """Return a deleted/overwritten key's flow extents to the free list.
@@ -1003,18 +1020,19 @@ class CPCSNVMeBackend(StorageBackend):
         meta = self.metadata.get(key)
         if not isinstance(meta, dict) or meta.get("storage_mode") != "kv_flow":
             return
-        if meta.get("kv_flow") == "vslm":
-            free, resv = self._flow_free["vslm"], self._flow_resv["vslm"]
-            for c in meta.get("chunks", []):
-                off = c.get("rel_off")
+        with self._flow_alloc_lock:
+            if meta.get("kv_flow") == "vslm":
+                free, resv = self._flow_free["vslm"], self._flow_resv["vslm"]
+                for c in meta.get("chunks", []):
+                    off = c.get("rel_off")
+                    if isinstance(off, int):
+                        free.append((off, resv.pop(
+                            off, int(c.get("raw_len", 0)) + 4096)))
+            else:
+                off = meta.get("store_off")
                 if isinstance(off, int):
-                    free.append((off, resv.pop(
-                        off, int(c.get("raw_len", 0)) + 4096)))
-        else:
-            off = meta.get("store_off")
-            if isinstance(off, int):
-                self._flow_free["nvm"].append((off, self._flow_resv["nvm"].pop(
-                    off, int(meta.get("packed_size", 0)))))
+                    self._flow_free["nvm"].append((off, self._flow_resv["nvm"].pop(
+                        off, int(meta.get("packed_size", 0)))))
 
     def _flow_kernel_mode(self) -> str:
         return self.mode if self.mode in ("lossless_compress", "int8_quantize",
@@ -1038,9 +1056,13 @@ class CPCSNVMeBackend(StorageBackend):
             extra["layout_block_size_bytes"] = int(min(self.block_size_bytes,
                                                        1024 * 1024))
         rsid, pind = self._flow_rsid, self._resolve_program_binding(op)[1]
-        result = self.client.execute(
-            cpcs_nsid=self.cpcs_nsid, rsid=rsid, pind=pind, payload=chunk,
-            op=op, mode=self.mode, extra=extra)
+        # One in-flight Execute per backend: the firmware leases the WHOLE
+        # RSID per execute (see _exec_lock init comment), so concurrent
+        # executes only trade a queue wait for a rejected ~400 ms spawn.
+        with self._exec_lock:
+            result = self.client.execute(
+                cpcs_nsid=self.cpcs_nsid, rsid=rsid, pind=pind, payload=chunk,
+                op=op, mode=self.mode, extra=extra)
         self._record_metrics(result, metrics_mode)
         raw = int(result.extra.get("result_raw", result.extra.get("result_dw0", 0)) or 0)
         out_len = int(result.extra.get("result_value", raw & 0xFFFFFFFF) or 0)
@@ -1112,10 +1134,11 @@ class CPCSNVMeBackend(StorageBackend):
             return self._flow_write_inner(key, data, allocs)
         except Exception:
             pool = "vslm" if self.kv_flow == "vslm" else "nvm"
-            free, resv = self._flow_free[pool], self._flow_resv[pool]
-            for off in allocs:
-                if off in resv:
-                    free.append((off, resv.pop(off)))
+            with self._flow_alloc_lock:
+                free, resv = self._flow_free[pool], self._flow_resv[pool]
+                for off in allocs:
+                    if off in resv:
+                        free.append((off, resv.pop(off)))
             raise
 
     def _flow_write_inner(self, key: str, data: np.ndarray,
