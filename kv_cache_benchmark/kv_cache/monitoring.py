@@ -97,6 +97,30 @@ class SystemMetricsTracker:
         self._end_net = None
         self._start_io: Dict[str, int] = {}
         self._end_io: Dict[str, int] = {}
+        # In-window RSS sampling (A1 memory-relief claim, 08-26): ru_maxrss
+        # is process-lifetime peak, which the setup phase (256 MiB noise
+        # buffer) dominates identically for every arm -- only samples taken
+        # BETWEEN start() and stop() can separate the arms.
+        self._rss_samples: List[float] = []
+        self._rss_thread = None
+        self._rss_stop = None
+
+    @staticmethod
+    def _read_vmrss_bytes() -> Optional[float]:
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        return float(line.split()[1]) * 1024.0
+        except OSError:
+            return None
+        return None
+
+    def _rss_sampler(self, interval_s: float) -> None:
+        while not self._rss_stop.wait(interval_s):
+            v = self._read_vmrss_bytes()
+            if v is not None:
+                self._rss_samples.append(v)
 
     def start(self) -> None:
         self._started = True
@@ -105,10 +129,20 @@ class SystemMetricsTracker:
         self._start_rusage = self._get_rusage()
         self._start_net = _read_proc_net_totals()
         self._start_io = _read_proc_self_io()
+        self._rss_samples = []
+        if self._read_vmrss_bytes() is not None:  # Linux only
+            self._rss_stop = threading.Event()
+            self._rss_thread = threading.Thread(
+                target=self._rss_sampler, args=(0.5,), daemon=True)
+            self._rss_thread.start()
 
     def stop(self) -> None:
         if not self._started:
             return
+        if self._rss_thread is not None:
+            self._rss_stop.set()
+            self._rss_thread.join(timeout=2.0)
+            self._rss_thread = None
         self._end_wall = time.perf_counter()
         self._end_proc_cpu = time.process_time()
         self._end_rusage = self._get_rusage()
@@ -152,6 +186,12 @@ class SystemMetricsTracker:
 
         if end_rusage is not None:
             out["process_max_rss_bytes"] = float(_rss_to_bytes(float(getattr(end_rusage, "ru_maxrss", 0.0))))
+
+        if self._rss_samples:
+            out["run_rss_peak_bytes"] = float(max(self._rss_samples))
+            out["run_rss_mean_bytes"] = float(
+                sum(self._rss_samples) / len(self._rss_samples))
+            out["run_rss_samples"] = float(len(self._rss_samples))
 
         if self._start_net is not None and end_net is not None:
             out["fabric_rx_bytes"] = float(max(end_net[0] - self._start_net[0], 0))
