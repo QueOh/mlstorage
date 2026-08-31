@@ -364,6 +364,10 @@ def main():
                         help='CPCS client transport.')
     parser.add_argument('--cpcs-storage-mode', type=str, default='file', choices=['file', 'arena'],
                         help='CPCS storage layout mode for persisted payloads.')
+    parser.add_argument('--kv-flow-rsids', type=int, default=1,
+                        help='A1W per-worker RSIDs: N disjoint MRSes so N executes run '
+                             'concurrently on device compute threads (firmware leases are '
+                             'per-range). 1 = legacy single-RSID serialization.')
     parser.add_argument('--kv-flow', type=str, default='',
                         choices=['', 'hostnvm', 'pslm', 'vslm'],
                         help='A1W offload flow: hostnvm = host transform + NVMe write to the '
@@ -756,6 +760,7 @@ def main():
         'batch_size': args.cpcs_batch_size,
         'fallback_on_error': args.cpcs_fallback_on_error,
         'kv_flow': args.kv_flow,
+        'kv_flow_rsids': args.kv_flow_rsids,
         'nvm_nsid': args.kv_nvm_nsid,
         'pslm_nsid': args.kv_pslm_nsid,
         'kv_exec_max_bytes': args.kv_exec_max_bytes,
@@ -822,6 +827,7 @@ def main():
         'client': args.cpcs_client,
         'storage_mode': args.cpcs_storage_mode,
         'kv_flow': args.kv_flow,
+        'kv_flow_rsids': args.kv_flow_rsids,
         'spdk_inventory': args.spdk_inventory,
         'bootstrap': {
             'enabled': (

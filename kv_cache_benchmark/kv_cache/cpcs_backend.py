@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import tempfile
 import time
@@ -21,6 +22,8 @@ import numpy as np
 from kv_cache.backends import StorageBackend
 from kv_cache.cpcs_client import CPCSClient, MockCPCSClient, SpdkPassthruCPCSClient, SpdkRpcBootstrap
 from kv_cache.cpcs_metrics import CPCSMetrics
+
+logger = logging.getLogger(__name__)
 
 
 class CPCSNVMeBackend(StorageBackend):
@@ -146,14 +149,16 @@ class CPCSNVMeBackend(StorageBackend):
         self.kv_scratch_bytes = int(config.get("kv_scratch_mb", 64) or 64) * 1024 * 1024
         self.kv_pslm_mr_bytes = int(config.get("kv_pslm_mr_mb", 64) or 64) * 1024 * 1024
         self._nvm_next_offset = 0
-        self._vslm_arena_next = 0
         # Extent reuse for the flow stores. Bump-only allocation exhausts
         # ANY arena size under demote churn (each re-demotion of a block
         # allocated fresh space); the cache calls delete(key) whenever an
         # entry leaves a tier, so freed extents are recycled first-fit.
         # No splitting: serving KV blocks are uniform enough that whole-
-        # extent reuse keeps fragmentation negligible.
-        self._flow_free = {"vslm": [], "nvm": []}   # pool -> [(off, len)]
+        # extent reuse keeps fragmentation negligible. The vslm arena is
+        # per-SLOT since 08-31 (per-worker RSIDs): free lists and bump
+        # cursors are keyed by slot; offsets stay GLOBAL arena-relative.
+        self._vslm_arena_next: Dict[int, int] = {}  # slot -> bump cursor
+        self._flow_free = {"vslm": {}, "nvm": []}   # vslm: slot -> [(off, len)]
         self._flow_resv = {"vslm": {}, "nvm": {}}   # pool -> {off: len}
         # Concurrency (08-24 cluster finding, VM-reproduced): serving runs
         # this backend from MANY worker threads.
@@ -168,9 +173,35 @@ class CPCSNVMeBackend(StorageBackend):
         #    FIRMWARE DESIGN -- disclose, don't fight.
         import threading as _threading
         self._flow_alloc_lock = _threading.Lock()
-        self._exec_lock = _threading.Lock()
+        # Per-worker RSIDs (08-31 tuning lever): firmware leases are
+        # PER-RANGE per lease_id (execute.c), so N MRSes with disjoint
+        # (4 KiB-page-disjoint on vSLM) ranges execute CONCURRENTLY on
+        # distinct compute threads. N=1 keeps the legacy single-RSID
+        # serialization. Worker threads are assigned slots round-robin
+        # on first use; each slot gets its own execute lock and (vslm)
+        # its own arena slice + allocator.
+        self.kv_flow_rsids = max(1, int(config.get("kv_flow_rsids", 1) or 1))
+        self._exec_locks = [_threading.Lock()
+                            for _ in range(self.kv_flow_rsids)]
+        self._exec_lock = self._exec_locks[0]  # legacy alias (N=1 path)
+        self._slot_local = _threading.local()
+        self._slot_next = 0
+        self._slot_lock = _threading.Lock()
         self._flow_rsid = 0
+        self._flow_rsids: List[int] = []
         self._flow_ranges: List[Dict[str, int]] = []
+        # flow-attributable initiator memory accounting (08-31, the
+        # figure-(b) metric): output bytes MATERIALIZED host-side
+        # (hostnvm transform product), bytes READ BACK device->host
+        # (pslm copy-out + decode read-backs), and a max-updated
+        # per-request working-buffer peak. WRITE-direction is the
+        # headline; read-path read-backs are counted separately so the
+        # claim stays honest (vslm also reads back on decode).
+        self._flow_output_bytes_total = 0
+        self._flow_readback_bytes_total = 0
+        self._flow_read_readback_bytes_total = 0
+        self._flow_workbuf_peak_bytes = 0
+        self._flow_mem_requests_total = 0
         if self.kv_flow in ("pslm", "vslm"):
             self._flow_bootstrap_mrs()
 
@@ -952,58 +983,115 @@ class CPCSNVMeBackend(StorageBackend):
     # extra {output_mr_id, output_offset, output_length}; the device packs
     # out_len in CQE DW0 and crc32 in DW1 (checked on every read-back).
 
+    # --- per-worker slot geometry (N = kv_flow_rsids; N=1 == legacy) ----
+    _SLOT_PAGE = 4096  # vSLM lease-overlap granularity (page-rounded)
+
+    def _slot_scratch(self, slot: int) -> tuple:
+        n = self.kv_flow_rsids
+        size = self._align_down(self.kv_scratch_bytes // n, self._SLOT_PAGE)
+        return slot * size, size
+
+    def _slot_arena(self, slot: int) -> tuple:
+        """(global arena-relative base, slice length) for a slot."""
+        n = self.kv_flow_rsids
+        size = self._align_down(self.kv_vslm_arena_bytes // n,
+                                self._SLOT_PAGE)
+        return slot * size, size
+
+    def _slot_pslm(self, slot: int) -> tuple:
+        n = self.kv_flow_rsids
+        size = self._align_down(self.kv_pslm_mr_bytes // n, self._SLOT_PAGE)
+        return slot * size, size
+
+    @staticmethod
+    def _align_down(v: int, a: int) -> int:
+        return (int(v) // a) * a
+
+    def _flow_slot(self) -> int:
+        """This worker thread's slot (round-robin on first use)."""
+        slot = getattr(self._slot_local, "slot", None)
+        if slot is None:
+            with self._slot_lock:
+                slot = self._slot_next % self.kv_flow_rsids
+                self._slot_next += 1
+            self._slot_local.slot = slot
+        return slot
+
     def _flow_bootstrap_mrs(self) -> None:
-        if self.kv_flow == "vslm":
-            ranges = [
-                {"nsid": self.slm_nsid, "starting_byte": 0,
-                 "length": self.kv_scratch_bytes},
-                {"nsid": self.slm_nsid, "starting_byte": self.kv_scratch_bytes,
-                 "length": self.kv_vslm_arena_bytes},
-            ]
-        else:  # pslm
-            ranges = [
-                {"nsid": self.pslm_nsid, "starting_byte": 0,
-                 "length": self.kv_pslm_mr_bytes},
-            ]
-        rsid = self.client.create_mrs(self.slm_nsid, ranges,
-                                      cpcs_nsid=self.cpcs_nsid)
-        self._flow_rsid = int(max(1, rsid))
-        self._flow_ranges = ranges
-        self.bootstrap_status["kv_flow_mrs"] = {
-            "flow": self.kv_flow, "rsid": self._flow_rsid, "ranges": ranges,
-        }
+        n = self.kv_flow_rsids
+        mrs_list = []
+        for slot in range(n):
+            if self.kv_flow == "vslm":
+                s_base, s_len = self._slot_scratch(slot)
+                a_base, a_len = self._slot_arena(slot)
+                ranges = [
+                    {"nsid": self.slm_nsid, "starting_byte": s_base,
+                     "length": s_len},
+                    {"nsid": self.slm_nsid,
+                     "starting_byte": self.kv_scratch_bytes + a_base,
+                     "length": a_len},
+                ]
+            else:  # pslm
+                p_base, p_len = self._slot_pslm(slot)
+                ranges = [
+                    {"nsid": self.pslm_nsid, "starting_byte": p_base,
+                     "length": p_len},
+                ]
+            rsid = self.client.create_mrs(self.slm_nsid, ranges,
+                                          cpcs_nsid=self.cpcs_nsid)
+            self._flow_rsids.append(int(max(1, rsid)))
+            mrs_list.append({"flow": self.kv_flow, "slot": slot,
+                             "rsid": self._flow_rsids[-1],
+                             "ranges": ranges})
+        self._flow_rsid = self._flow_rsids[0]
+        self._flow_ranges = mrs_list[0]["ranges"]
+        self.bootstrap_status["kv_flow_mrs"] = (
+            mrs_list[0] if n == 1 else mrs_list)
 
     def _flow_chunk_bytes(self) -> int:
         cap = int(self.kv_exec_max_bytes)
         if self.kv_flow == "pslm":
-            cap = min(cap, self.kv_pslm_mr_bytes)
+            cap = min(cap, self._slot_pslm(0)[1])
         return max(cap, self.slm_rw_lba_bytes)
 
-    def _flow_alloc(self, length: int) -> int:
+    def _arena_slot_of(self, off: int) -> int:
+        """Owning slot of a GLOBAL arena-relative offset."""
+        _, size = self._slot_arena(0)
+        return min(int(off) // max(1, size), self.kv_flow_rsids - 1)
+
+    def _flow_alloc(self, length: int, slot: int = 0) -> int:
         """Allocate in the flow's persistent store; returns the store
-        offset (namespace-absolute for nvm, arena-RELATIVE for vslm).
+        offset (namespace-absolute for nvm, GLOBAL arena-relative for
+        vslm -- slot slices are carved from the global arena space).
         Reuses freed extents first (see _flow_reclaim), then bumps.
         Lock-guarded: the free-list scan/del raced under threaded serving
         and could hand the SAME extent to two writers (08-24)."""
         align = max(1, int(self.slm_rw_lba_bytes))
-        pool = "vslm" if self.kv_flow == "vslm" else "nvm"
         with self._flow_alloc_lock:
-            free = self._flow_free[pool]
+            if self.kv_flow == "vslm":
+                free = self._flow_free["vslm"].setdefault(slot, [])
+            else:
+                free = self._flow_free["nvm"]
+            pool = "vslm" if self.kv_flow == "vslm" else "nvm"
             for i, (foff, flen) in enumerate(free):
                 if flen >= length:
                     del free[i]
                     self._flow_resv[pool][foff] = flen
                     return foff
             if self.kv_flow == "vslm":
-                off = self._align_up(self._vslm_arena_next, align)
-                self._vslm_arena_next = off + length
-                if self._vslm_arena_next > self.kv_vslm_arena_bytes:
-                    self._vslm_arena_next = off  # roll back the failed bump
+                base, size = self._slot_arena(slot)
+                nxt = self._vslm_arena_next.setdefault(slot, 0)
+                off_rel = self._align_up(nxt, align)
+                if off_rel + length > size:
                     raise RuntimeError(
-                        "vSLM arena exhausted -- raise --kv-vslm-arena-mb "
-                        f"(want={length} next={off} cap={self.kv_vslm_arena_bytes} "
+                        "vSLM arena slice exhausted -- raise "
+                        "--kv-vslm-arena-mb or lower --kv-flow-rsids "
+                        f"(slot={slot}/{self.kv_flow_rsids} want={length} "
+                        f"next={off_rel} slice={size} "
                         f"free_extents={len(free)} "
                         f"free_bytes={sum(l for _, l in free)})")
+                self._vslm_arena_next[slot] = off_rel + length
+                off = base + off_rel
                 self._flow_resv[pool][off] = length
                 return off
             off = self._align_up(self._nvm_next_offset, align)
@@ -1022,12 +1110,15 @@ class CPCSNVMeBackend(StorageBackend):
             return
         with self._flow_alloc_lock:
             if meta.get("kv_flow") == "vslm":
-                free, resv = self._flow_free["vslm"], self._flow_resv["vslm"]
+                resv = self._flow_resv["vslm"]
                 for c in meta.get("chunks", []):
                     off = c.get("rel_off")
                     if isinstance(off, int):
-                        free.append((off, resv.pop(
-                            off, int(c.get("raw_len", 0)) + 4096)))
+                        # route the extent back to its OWNING slot's list
+                        self._flow_free["vslm"].setdefault(
+                            self._arena_slot_of(off), []).append(
+                            (off, resv.pop(
+                                off, int(c.get("raw_len", 0)) + 4096)))
             else:
                 off = meta.get("store_off")
                 if isinstance(off, int):
@@ -1055,11 +1146,15 @@ class CPCSNVMeBackend(StorageBackend):
         if self.mode == "layout":
             extra["layout_block_size_bytes"] = int(min(self.block_size_bytes,
                                                        1024 * 1024))
-        rsid, pind = self._flow_rsid, self._resolve_program_binding(op)[1]
-        # One in-flight Execute per backend: the firmware leases the WHOLE
-        # RSID per execute (see _exec_lock init comment), so concurrent
-        # executes only trade a queue wait for a rejected ~400 ms spawn.
-        with self._exec_lock:
+        slot = self._flow_slot()
+        rsid = (self._flow_rsids[slot] if self._flow_rsids
+                else self._flow_rsid)
+        pind = self._resolve_program_binding(op)[1]
+        # One in-flight Execute per SLOT: the firmware leases every
+        # resolved range of an RSID per Execute, so concurrency on ONE
+        # MRS is refused with 01/95 -- but leases are per-range, so N
+        # slot-disjoint MRSes execute in parallel (kv_flow_rsids > 1).
+        with self._exec_locks[slot % len(self._exec_locks)]:
             result = self.client.execute(
                 cpcs_nsid=self.cpcs_nsid, rsid=rsid, pind=pind, payload=chunk,
                 op=op, mode=self.mode, extra=extra)
@@ -1133,12 +1228,20 @@ class CPCSNVMeBackend(StorageBackend):
         try:
             return self._flow_write_inner(key, data, allocs)
         except Exception:
-            pool = "vslm" if self.kv_flow == "vslm" else "nvm"
             with self._flow_alloc_lock:
-                free, resv = self._flow_free[pool], self._flow_resv[pool]
-                for off in allocs:
-                    if off in resv:
-                        free.append((off, resv.pop(off)))
+                if self.kv_flow == "vslm":
+                    resv = self._flow_resv["vslm"]
+                    for off in allocs:
+                        if off in resv:
+                            self._flow_free["vslm"].setdefault(
+                                self._arena_slot_of(off), []).append(
+                                (off, resv.pop(off)))
+                else:
+                    free = self._flow_free["nvm"]
+                    resv = self._flow_resv["nvm"]
+                    for off in allocs:
+                        if off in resv:
+                            free.append((off, resv.pop(off)))
             raise
 
     def _flow_write_inner(self, key: str, data: np.ndarray,
@@ -1163,6 +1266,9 @@ class CPCSNVMeBackend(StorageBackend):
         op = str(profile["op"])
         mmode = str(profile["metrics_mode"]) + f"_{self.kv_flow}"
 
+        req_output = 0     # host-materialized transform output bytes
+        req_readback = 0   # device->host copy-out bytes (write dir)
+        req_workbuf = 0    # peak flow-held output/return buffer bytes
         if self.kv_flow == "hostnvm":
             t0 = time.perf_counter()
             pieces = [kv_kernels.encode(kmode, raw_payload[o:o + cap],
@@ -1175,10 +1281,14 @@ class CPCSNVMeBackend(StorageBackend):
             store_parts = []
             for piece, o in zip(pieces, range(0, len(raw_payload), cap)):
                 chunks.append({"packed_len": len(piece), "rel_off": pos,
-                               "raw_len": len(raw_payload[o:o + cap])})
+                               "raw_len": min(cap, len(raw_payload) - o)})
                 store_parts.append(piece)
                 pos += len(piece)
             packed_all = b"".join(store_parts)
+            # host arm materializes the FULL transformed block (pieces +
+            # the joined copy live simultaneously) -- the figure-(b) term
+            req_output = pos
+            req_workbuf = pos + len(packed_all)
             store_off = self._flow_alloc(len(packed_all))
             allocs.append(store_off)
             device_time += self._flow_store_write(self.nvm_nsid, store_off,
@@ -1186,48 +1296,61 @@ class CPCSNVMeBackend(StorageBackend):
             store_nsid = self.nvm_nsid
         else:
             out_mr = 2 if self.kv_flow == "vslm" else 1
-            store_parts = []
+            slot = self._flow_slot()
             arena_chunks = []
+            if self.kv_flow == "pslm":
+                # STREAMING copy-out (08-31): the bounded-MR protocol
+                # already forces chunking, so each chunk's read-back is
+                # written straight to the kvstore instead of being
+                # accumulated + joined (the old triple-buffer). Extent
+                # is allocated up-front at an upper bound (output never
+                # exceeds input; +container/alignment slack per chunk).
+                lba = max(1, int(self.slm_rw_lba_bytes))
+                n_chunks = max(1, -(-len(raw_payload) // cap))
+                store_off = self._flow_alloc(
+                    len(raw_payload) + n_chunks * (4096 + lba))
+                allocs.append(store_off)
+                p_base, p_len = self._slot_pslm(slot)
+                pos = 0
             for o in range(0, len(raw_payload), cap):
                 chunk = raw_payload[o:o + cap]
                 # Device encoders raw-fallback when output >= input, so the
                 # result never exceeds the chunk; +4096 covers containers.
                 if self.kv_flow == "vslm":
-                    rel = self._flow_alloc(len(chunk) + 4096)
-                    allocs.append(rel)
+                    rel_g = self._flow_alloc(len(chunk) + 4096, slot)
+                    allocs.append(rel_g)
                     out_cap = len(chunk) + 4096
+                    out_rel = rel_g - self._slot_arena(slot)[0]
                 else:
-                    rel = 0
-                    out_cap = min(self.kv_pslm_mr_bytes, len(chunk) + 4096)
-                r = self._flow_execute_chunk(op, chunk, out_mr, rel, out_cap, mmode)
+                    out_rel = 0
+                    out_cap = min(p_len, len(chunk) + 4096)
+                r = self._flow_execute_chunk(op, chunk, out_mr, out_rel,
+                                             out_cap, mmode)
                 device_time += r["latency_s"]
                 if self.kv_flow == "pslm":
-                    packed = self._flow_store_read(self.pslm_nsid, rel,
+                    packed = self._flow_store_read(self.pslm_nsid, p_base,
                                                    r["out_len"], mmode)
                     if (zlib.crc32(packed) & 0xFFFFFFFF) != r["crc"] and r["crc"]:
                         raise RuntimeError("kv_flow pslm read-back crc mismatch")
-                    store_parts.append(packed)
+                    device_time += self._flow_store_write(
+                        self.nvm_nsid, store_off + pos, packed, mmode)
                     chunks.append({"packed_len": r["out_len"],
+                                   "rel_off": pos,
                                    "raw_len": len(chunk), "crc": r["crc"]})
+                    req_readback += r["out_len"]
+                    req_workbuf = max(req_workbuf, r["out_len"])
+                    pos = self._align_up(pos + r["out_len"], lba)
+                    del packed
                 else:
-                    arena_chunks.append({"rel_off": rel,
+                    arena_chunks.append({"rel_off": rel_g,
                                          "packed_len": r["out_len"],
                                          "raw_len": len(chunk),
                                          "crc": r["crc"]})
             if self.kv_flow == "pslm":
-                packed_all = b"".join(store_parts)
-                store_off = self._flow_alloc(len(packed_all))
-                allocs.append(store_off)
-                pos = 0
-                for c in chunks:
-                    c["rel_off"] = pos
-                    pos += c["packed_len"]
-                device_time += self._flow_store_write(self.nvm_nsid, store_off,
-                                                      packed_all, mmode)
                 store_nsid = self.nvm_nsid
             else:
                 chunks = arena_chunks
-                store_off = 0  # per-chunk rel offsets are authoritative
+                store_off = 0  # per-chunk GLOBAL rel offsets authoritative
                 store_nsid = self.slm_nsid
 
         checksum = int(zlib.crc32(raw_payload) & 0xFFFFFFFF)
@@ -1243,6 +1366,18 @@ class CPCSNVMeBackend(StorageBackend):
         self.metadata[key] = meta
         allocs.clear()  # committed to metadata -- no longer abortable
         self._meta_path(key).write_text(json.dumps(meta), encoding="utf-8")
+        # figure-(b) accounting (write direction): totals summed, peak
+        # max-updated; per-request line at DEBUG for the return-data
+        # logger the operator asked for (08-31).
+        self._flow_output_bytes_total += req_output
+        self._flow_readback_bytes_total += req_readback
+        self._flow_workbuf_peak_bytes = max(self._flow_workbuf_peak_bytes,
+                                            req_workbuf)
+        self._flow_mem_requests_total += 1
+        logger.debug(
+            "kv_flow %s write mem: output=%dB readback=%dB workbuf=%dB "
+            "block=%dB", self.kv_flow, req_output, req_readback,
+            req_workbuf, len(raw_payload))
         end = time.perf_counter()
         host_time = (end - start) - device_time
         return StorageBackend.IOTiming(total=end - start, device=device_time,
@@ -1286,8 +1421,15 @@ class CPCSNVMeBackend(StorageBackend):
                                          int(c["raw_len"]) + 4096, mmode,
                                          phase="read")
             device_time += r["latency_s"]
-            scratch_nsid = self.pslm_nsid if self.kv_flow == "pslm" else self.slm_nsid
-            decoded = self._flow_store_read(scratch_nsid, 0, r["out_len"], mmode)
+            # decode output lands in THIS worker slot's scratch slice
+            slot = self._flow_slot()
+            if self.kv_flow == "pslm":
+                scratch_nsid, s_base = self.pslm_nsid, self._slot_pslm(slot)[0]
+            else:
+                scratch_nsid, s_base = self.slm_nsid, self._slot_scratch(slot)[0]
+            decoded = self._flow_store_read(scratch_nsid, s_base,
+                                            r["out_len"], mmode)
+            self._flow_read_readback_bytes_total += r["out_len"]
             out_parts.append(decoded)
         raw = b"".join(out_parts)
         if kmode != "int8_quantize":
@@ -1650,6 +1792,15 @@ class CPCSNVMeBackend(StorageBackend):
         summary["cpcs_slm_read_address_mode"] = str(self.slm_read_address_mode)
         summary["cpcs_slm_write_address_mode"] = str(self.slm_write_address_mode)
         summary["cpcs_slm_rw_lba_bytes"] = int(self.slm_rw_lba_bytes)
+        # figure-(b) flow-memory scalars: TOP-LEVEL numerics so cache.py
+        # auto-hoists them into cache_stats -> benchmark summary (08-31).
+        summary["cpcs_flow_output_bytes_total"] = int(self._flow_output_bytes_total)
+        summary["cpcs_flow_readback_bytes_total"] = int(self._flow_readback_bytes_total)
+        summary["cpcs_flow_read_readback_bytes_total"] = int(
+            self._flow_read_readback_bytes_total)
+        summary["cpcs_flow_workbuf_peak_bytes"] = int(self._flow_workbuf_peak_bytes)
+        summary["cpcs_flow_mem_requests_total"] = int(self._flow_mem_requests_total)
+        summary["cpcs_flow_rsids"] = int(self.kv_flow_rsids)
         if self.bootstrap_status:
             summary["cpcs_bootstrap"] = dict(self.bootstrap_status)
         if self.storage_mode == "arena":
@@ -1657,6 +1808,16 @@ class CPCSNVMeBackend(StorageBackend):
             summary["cpcs_index_path"] = str(self.index_path) if self.index_path else ""
             summary["cpcs_arena_next_offset"] = int(self._arena_next_offset)
         return summary
+
+    def reset_flow_mem_counters(self) -> None:
+        """Zero the figure-(b) accounting. Called via cache.reset_stats()
+        after prepopulation so the serving window's numbers are clean
+        (08-31: backend counters otherwise include the fill phase)."""
+        self._flow_output_bytes_total = 0
+        self._flow_readback_bytes_total = 0
+        self._flow_read_readback_bytes_total = 0
+        self._flow_workbuf_peak_bytes = 0
+        self._flow_mem_requests_total = 0
 
     def __del__(self):
         try:

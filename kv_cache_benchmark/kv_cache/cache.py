@@ -1220,3 +1220,9 @@ class MultiTierCache:
                     self.stats[key] = []
                 elif isinstance(value, (int, float)):
                     self.stats[key] = 0
+        # 08-31: the backend's flow-memory counters must reset with the
+        # window too, or prepopulation contaminates the figure-(b) rows.
+        nvme_backend = self.backends.get('nvme')
+        if nvme_backend is not None and hasattr(nvme_backend,
+                                                'reset_flow_mem_counters'):
+            nvme_backend.reset_flow_mem_counters()
