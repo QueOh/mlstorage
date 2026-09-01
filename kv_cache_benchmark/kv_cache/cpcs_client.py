@@ -1153,3 +1153,42 @@ class SpdkPassthruCPCSClient(CPCSClient):
             return Path(out_path).read_bytes()
         finally:
             Path(out_path).unlink(missing_ok=True)
+
+
+class KernelChannelCPCSClient(SpdkPassthruCPCSClient):
+    """SpdkPassthruCPCSClient with the per-command process spawn replaced
+    by the persistent kernel-initiator channel (kernel_channel.py):
+    connect once via kernel nvme-tcp, then one NVME_IOCTL_*64_CMD ioctl
+    per command. Only _run_checked is rerouted -- every command path
+    (execute, slm read/write/copy, probes, create_mrs) keeps building
+    the exact same argv and parsing the exact same stdout, so behavior
+    is byte-compatible minus the ~300-430 ms spawn tax. Failure text
+    carries the tool's "Command failed: sct=.. sc=.." form, so the
+    01/95 bounded-retry logic keeps working."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        from kv_cache.kernel_channel import KernelNvmeChannel
+        self._kernel_channel = KernelNvmeChannel(
+            trtype=self.trtype, traddr=self.traddr,
+            trsvcid=self.trsvcid, subnqn=self.subnqn,
+            hostnqn=self.hostnqn)
+
+    def _run_checked(self, cmd: List[str]) -> str:
+        from kv_cache.kernel_channel import Dw4Required
+        try:
+            return self._kernel_channel.run_passthru_argv(cmd)
+        except Dw4Required:
+            # CPCS Execute carries dlen in SQE DW4 (MPTR field) which the
+            # kernel ioctl cannot set -- those commands keep the spawn
+            # path until the operator lands execute coverage. RATIO
+            # WARNING: with executes on spawn and everything else on the
+            # channel, arm comparisons are DISTORTED (the host arm has no
+            # executes) -- see the analysis guide before typing rows.
+            return super()._run_checked(cmd)
+
+    def close(self) -> None:
+        try:
+            self._kernel_channel.close()
+        finally:
+            super().close()

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from kv_cache.backends import StorageBackend
-from kv_cache.cpcs_client import CPCSClient, MockCPCSClient, SpdkPassthruCPCSClient, SpdkRpcBootstrap
+from kv_cache.cpcs_client import CPCSClient, KernelChannelCPCSClient, MockCPCSClient, SpdkPassthruCPCSClient, SpdkRpcBootstrap
 from kv_cache.cpcs_metrics import CPCSMetrics
 
 logger = logging.getLogger(__name__)
@@ -803,7 +803,12 @@ class CPCSNVMeBackend(StorageBackend):
         if self.client_type != "spdk_passthru":
             raise ValueError(f"Unsupported CPCS client: {self.client_type}")
 
-        return SpdkPassthruCPCSClient(
+        # kernel_channel: same client, spawn funnel rerouted to the
+        # persistent kernel-initiator channel (09-01 tuning lever).
+        cls = (KernelChannelCPCSClient
+               if bool(config.get("kernel_channel"))
+               else SpdkPassthruCPCSClient)
+        return cls(
             spdk_nvme_passthru=str(config.get("spdk_nvme_passthru", "")),
             trtype=str(config.get("trtype", "TCP")),
             traddr=str(config.get("traddr", "")),

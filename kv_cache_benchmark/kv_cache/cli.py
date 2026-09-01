@@ -364,6 +364,11 @@ def main():
                         help='CPCS client transport.')
     parser.add_argument('--cpcs-storage-mode', type=str, default='file', choices=['file', 'arena'],
                         help='CPCS storage layout mode for persisted payloads.')
+    parser.add_argument('--cpcs-kernel-channel', action='store_true',
+                        help='Route every fabric command through ONE persistent kernel '
+                             'nvme-tcp connection (ioctl per command) instead of a '
+                             'fresh spdk_nvme_passthru process per command (~300-430 ms '
+                             'spawn tax). Needs root + nvme-cli. Rows are a NEW vintage.')
     parser.add_argument('--kv-flow-rsids', type=int, default=1,
                         help='A1W per-worker RSIDs: N disjoint MRSes so N executes run '
                              'concurrently on device compute threads (firmware leases are '
@@ -761,6 +766,7 @@ def main():
         'fallback_on_error': args.cpcs_fallback_on_error,
         'kv_flow': args.kv_flow,
         'kv_flow_rsids': args.kv_flow_rsids,
+        'kernel_channel': args.cpcs_kernel_channel,
         'nvm_nsid': args.kv_nvm_nsid,
         'pslm_nsid': args.kv_pslm_nsid,
         'kv_exec_max_bytes': args.kv_exec_max_bytes,
@@ -828,6 +834,7 @@ def main():
         'storage_mode': args.cpcs_storage_mode,
         'kv_flow': args.kv_flow,
         'kv_flow_rsids': args.kv_flow_rsids,
+        'kernel_channel': args.cpcs_kernel_channel,
         'spdk_inventory': args.spdk_inventory,
         'bootstrap': {
             'enabled': (
