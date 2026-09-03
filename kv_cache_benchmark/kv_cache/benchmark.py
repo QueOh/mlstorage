@@ -31,6 +31,7 @@ from kv_cache.models import (
     QoSLevel, QOS_PROFILES, UserProfile, InferenceRequest,
 )
 from kv_cache.cache import MultiTierCache
+from kv_cache import stage_metrics
 from kv_cache.conversation import ConversationManager
 from kv_cache.prefix_cache import PrefixType, PrefixCacheManager
 from kv_cache.rag import RAGDocumentManager
@@ -590,12 +591,13 @@ class IntegratedBenchmark:
 
             # 1. Check for a prefix cache hit.
             if self.prefix_cache_manager:
-                prefix_entry, remaining_tokens = self.prefix_cache_manager.check_prefix_cache(request, self.model_config)
-                if prefix_entry:
-                    cache_type = 'system' if prefix_entry.prefix_type == PrefixType.SYSTEM_PROMPT else 'common'
-                    _, read_lat = self.cache.access_cache(prefix_entry.kv_cache_key, request.phase, cache_type)
-                    storage_latency += read_lat
-                    request.context_tokens = remaining_tokens
+                with stage_metrics.stage('prefix'):
+                    prefix_entry, remaining_tokens = self.prefix_cache_manager.check_prefix_cache(request, self.model_config)
+                    if prefix_entry:
+                        cache_type = 'system' if prefix_entry.prefix_type == PrefixType.SYSTEM_PROMPT else 'common'
+                        _, read_lat = self.cache.access_cache(prefix_entry.kv_cache_key, request.phase, cache_type)
+                        storage_latency += read_lat
+                        request.context_tokens = remaining_tokens
 
             # Skip steps 2+3 entirely in decode_only mode:
             # - Step 2 reads always miss (step 3 writes are skipped, so no entries exist)
@@ -605,34 +607,37 @@ class IntegratedBenchmark:
                 #    Reads every previous turn via access_cache (real I/O for entries
                 #    that survived eviction; immediate (None, 0.0) for evicted entries).
                 if self.conversation_manager and request.turn_number > 1:
-                    prev_keys = self.conversation_manager.get_all_previous_turn_keys(
-                        request.conversation_id, request.turn_number
-                    )
-                    batch_reads = self.cache.access_cache_many(prev_keys, InferencePhase.DECODE, 'multi_turn')
-                    for _, location, read_latency in batch_reads:
-                        if location is not None:
-                            storage_latency += read_latency
-                            with self.results_lock: self.results['multi_turn_cache_hits'] += 1
-                        else:
-                            with self.results_lock: self.results['multi_turn_cache_misses'] += 1
+                    with stage_metrics.stage('multi_turn'):
+                        prev_keys = self.conversation_manager.get_all_previous_turn_keys(
+                            request.conversation_id, request.turn_number
+                        )
+                        batch_reads = self.cache.access_cache_many(prev_keys, InferencePhase.DECODE, 'multi_turn')
+                        for _, location, read_latency in batch_reads:
+                            if location is not None:
+                                storage_latency += read_latency
+                                with self.results_lock: self.results['multi_turn_cache_hits'] += 1
+                            else:
+                                with self.results_lock: self.results['multi_turn_cache_misses'] += 1
 
                 # 3. Perform the main PREFILL operation (a cache WRITE).
                 if request.phase == InferencePhase.PREFILL or request.phase == InferencePhase.PREFILL_DECODE:
-                    success, location, write_latency = self.cache.allocate_cache(
-                        request.cache_key, request.context_tokens, InferencePhase.PREFILL
-                    )
+                    with stage_metrics.stage('prefill'):
+                        success, location, write_latency = self.cache.allocate_cache(
+                            request.cache_key, request.context_tokens, InferencePhase.PREFILL
+                        )
                     storage_latency += write_latency
                     with self.results_lock: self.results['prefill_latencies'].append(write_latency)
 
             # 4. Simulate a RAG operation.
             if self.rag_manager and random.random() < cfg('rag', 'request_probability', default=0.1):
-                doc_keys = list(self.rag_manager.documents.keys()) if self.rag_manager.documents else []
-                if doc_keys:
-                    doc_id = random.choice(doc_keys)
-                    chunks = self.rag_manager.retrieve_chunks(doc_id)
-                    rag_keys = [chunk.kv_cache_key for chunk in chunks]
-                    for _, _, read_lat in self.cache.access_cache_many(rag_keys, InferencePhase.DECODE):
-                        storage_latency += read_lat
+                with stage_metrics.stage('rag'):
+                    doc_keys = list(self.rag_manager.documents.keys()) if self.rag_manager.documents else []
+                    if doc_keys:
+                        doc_id = random.choice(doc_keys)
+                        chunks = self.rag_manager.retrieve_chunks(doc_id)
+                        rag_keys = [chunk.kv_cache_key for chunk in chunks]
+                        for _, _, read_lat in self.cache.access_cache_many(rag_keys, InferencePhase.DECODE):
+                            storage_latency += read_lat
 
             # 5. Perform the DECODE operation (a cache READ).
             # Skip if prefill_only mode (disaggregated prefill node)
@@ -645,26 +650,30 @@ class IntegratedBenchmark:
                     else:
                         decode_key = request.cache_key
                     
-                    location, read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, cache_type)
-                    storage_latency += read_latency
-                    decode_total_latency = read_latency
+                    with stage_metrics.stage('decode'):
+                        location, read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, cache_type)
+                        storage_latency += read_latency
+                        decode_total_latency = read_latency
 
-                    if location is None:
-                        # Cache miss during decode - need to allocate (unless decode_only)
-                        if not self.decode_only:
-                            _, _, write_latency = self.cache.allocate_cache(
-                                request.cache_key,
-                                request.context_tokens,
-                                InferencePhase.PREFILL
-                            )
-                            storage_latency += write_latency
-                    else:
-                        decode_batch_size = cfg('decode', 'batch_size', default=32)
-                        num_batched_reads = max(1, (request.generate_tokens + decode_batch_size - 1) // decode_batch_size)
-                        for _ in range(num_batched_reads):
-                            _, batch_read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, cache_type)
-                            storage_latency += batch_read_latency
-                            decode_total_latency += batch_read_latency
+                        if location is None:
+                            # Cache miss during decode - need to allocate (unless decode_only)
+                            if not self.decode_only:
+                                # a miss-triggered allocate is PREFILL work
+                                # (nested stage: exclusive attribution)
+                                with stage_metrics.stage('prefill'):
+                                    _, _, write_latency = self.cache.allocate_cache(
+                                        request.cache_key,
+                                        request.context_tokens,
+                                        InferencePhase.PREFILL
+                                    )
+                                storage_latency += write_latency
+                        else:
+                            decode_batch_size = cfg('decode', 'batch_size', default=32)
+                            num_batched_reads = max(1, (request.generate_tokens + decode_batch_size - 1) // decode_batch_size)
+                            for _ in range(num_batched_reads):
+                                _, batch_read_latency = self.cache.access_cache(decode_key, InferencePhase.DECODE, cache_type)
+                                storage_latency += batch_read_latency
+                                decode_total_latency += batch_read_latency
 
                     with self.results_lock: self.results['decode_latencies'].append(decode_total_latency)
 
@@ -1569,6 +1578,25 @@ class IntegratedBenchmark:
         summary['slo_ms'] = self.slo_ms if self.slo_ms > 0 else None
         summary['slo_attainment'] = (
             float(np.mean((e2e * 1000.0) <= self.slo_ms)) if self.slo_ms > 0 else None)
+        # 09-03: per-stage attribution block + percentile summaries for the
+        # per-op phase series (raw lists were persisted but never
+        # aggregated; nearest-rank percentiles).
+        def _series_stats(vals):
+            if not vals:
+                return None
+            v = sorted(vals)
+            n = len(v)
+
+            def _pct(p):
+                return v[max(0, min(n - 1,
+                                    int(round(p / 100.0 * n + 0.5)) - 1))]
+            return {'n': n, 'mean': sum(v) / n, 'p50': _pct(50),
+                    'p95': _pct(95), 'p99': _pct(99)}
+        summary['prefill_latency_s'] = _series_stats(
+            self.results.get('prefill_latencies') or [])
+        summary['decode_latency_s'] = _series_stats(
+            self.results.get('decode_latencies') or [])
+        summary['stage_breakdown'] = stage_metrics.snapshot()
         self.results['summary'] = summary
         if self.latency_dump and self._latency_dump_records is not None:
             with self.results_lock:

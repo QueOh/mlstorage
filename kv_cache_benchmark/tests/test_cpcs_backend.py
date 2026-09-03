@@ -91,6 +91,10 @@ def _base_args() -> argparse.Namespace:
         cpcs_slm_rw_lba_bytes=0,
         cpcs_slm_read_address_mode='byte',
         cpcs_slm_write_address_mode='lba',
+        # validate_args grew >0 checks for these after this fixture was
+        # written; use the cli.py defaults.
+        cpcs_block_size_kb=4,
+        cpcs_batch_size=1,
     )
 
 

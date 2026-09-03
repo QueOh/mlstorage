@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from kv_cache._compat import TORCH_AVAILABLE, CUPY_AVAILABLE
+from kv_cache import stage_metrics
 from kv_cache.config import cfg
 from kv_cache.models import ModelConfig, InferencePhase
 from kv_cache.backends import (
@@ -405,9 +406,14 @@ class MultiTierCache:
                 size = entry['size']
 
             try:
-                data, read_timing = self.backends[from_tier].read(key)
-                write_timing = self.backends[to_tier].write(key, data)
-                self.backends[from_tier].delete(key)
+                with stage_metrics.stage('demotion'):
+                    data, read_timing = self.backends[from_tier].read(key)
+                    write_timing = self.backends[to_tier].write(key, data)
+                    self.backends[from_tier].delete(key)
+                    stage_metrics.note_io(read_timing, stage_name='demotion')
+                    stage_metrics.note_io(write_timing, stage_name='demotion')
+                    stage_metrics.note_moved(host_bytes=size,
+                                             stage_name='demotion')
 
                 if self.io_tracer is not None:
                     self.io_tracer.log('Read',  size, from_tier, key=key, phase='Evict')
@@ -681,7 +687,11 @@ class MultiTierCache:
             data = None
         else:
             try:
-                data = self.generator.generate(sequence_length=num_tokens, key=key)
+                # kv_gen is benchmark scaffolding (synthetic input + XOR
+                # stamp), NOT offloadable work: bracketed as an excluded
+                # stage so it never pollutes prefill CPU attribution.
+                with stage_metrics.stage('kv_gen', excluded=True):
+                    data = self.generator.generate(sequence_length=num_tokens, key=key)
             except MemoryError:
                 logger.error(f"MemoryError generating cache for key {key} ({num_tokens} tokens)")
                 return False, 'none', 0.0
@@ -753,6 +763,7 @@ class MultiTierCache:
                 elif allocated_tier == 'gpu':
                     self.stats['gpu_write_latencies'].append(timing.total)
 
+            stage_metrics.note_io(timing)
             del data
             return True, allocated_tier, timing.total
 
@@ -863,6 +874,7 @@ class MultiTierCache:
                             num_tokens = entry_size / self.model_config.kv_cache_size_per_token
                             self.stats['storage_tokens_processed'] += num_tokens
 
+                stage_metrics.note_io(timing)
                 return location, timing.total
             except Exception as e:
                 return location, 0.0
@@ -999,6 +1011,7 @@ class MultiTierCache:
                             self.stats['storage_read_latencies'].extend([timing.total] * len(positions))
                             self.stats['storage_read_device_latencies'].extend([timing.device] * len(positions))
                             self.stats['storage_read_host_latencies'].extend([timing.host] * len(positions))
+                            stage_metrics.note_io(timing)
                             if self.model_config.kv_cache_size_per_token > 0:
                                 num_tokens = entry_size / self.model_config.kv_cache_size_per_token
                                 self.stats['storage_tokens_processed'] += num_tokens * len(positions)
@@ -1226,3 +1239,6 @@ class MultiTierCache:
         if nvme_backend is not None and hasattr(nvme_backend,
                                                 'reset_flow_mem_counters'):
             nvme_backend.reset_flow_mem_counters()
+        # 09-03: per-stage attribution resets with the window too, so
+        # prepopulation/preconditioning never contaminates the breakdown.
+        stage_metrics.reset()

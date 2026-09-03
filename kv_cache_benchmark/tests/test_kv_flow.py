@@ -105,7 +105,7 @@ def test_vslm_persists_in_arena_no_copyout(tmp_path):
 def test_vslm_arena_exhaustion_raises(tmp_path):
     b = make_backend(tmp_path, "vslm", "noop", kv_vslm_arena_mb=1)
     big = np.zeros(300000, dtype="<f4")  # 1.2MB > 1MB arena
-    with pytest.raises(RuntimeError, match="arena exhausted"):
+    with pytest.raises(RuntimeError, match="arena (slice )?exhausted"):
         b.write("k", big)
 
 

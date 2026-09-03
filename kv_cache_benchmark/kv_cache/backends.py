@@ -11,7 +11,7 @@ import time
 import logging
 import tempfile
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -44,6 +44,14 @@ class StorageBackend:
         total: float
         device: float
         host: float
+        # Optional per-command decomposition (exec_cmd/slm_read/slm_write/
+        # nvm_io/host_kernel/...) -- populated only by backends measuring
+        # a REAL split. Consumers must treat absence as "not decomposed".
+        components: Optional[Dict[str, float]] = None
+        # "host_only" marks tiers with no device component (CPU/GPU memcpy
+        # tiers) so device-time columns exclude them instead of averaging
+        # in fabricated values (pre-09-03 they reported device == total).
+        split: Optional[str] = None
 
     def write(self, key: str, data: np.ndarray) -> 'StorageBackend.IOTiming':
         """Writes data to the backend and returns latency breakdown."""
@@ -153,7 +161,7 @@ class GPUMemoryBackend(StorageBackend):
             cp.cuda.Stream.null.synchronize()
 
         total = time.perf_counter() - start
-        return StorageBackend.IOTiming(total=total, device=total, host=total)
+        return StorageBackend.IOTiming(total=total, device=0.0, host=total, split="host_only")
 
     def read(self, key: str) -> Tuple[np.ndarray, StorageBackend.IOTiming]:
         """Reads a tensor from GPU VRAM back to a NumPy array on the CPU."""
@@ -172,7 +180,7 @@ class GPUMemoryBackend(StorageBackend):
             cp.cuda.Stream.null.synchronize()
 
         total = time.perf_counter() - start
-        return data, StorageBackend.IOTiming(total=total, device=total, host=total)
+        return data, StorageBackend.IOTiming(total=total, device=0.0, host=total, split="host_only")
 
     def delete(self, key: str):
         if key in self.cache:
@@ -210,7 +218,7 @@ class CPUMemoryBackend(StorageBackend):
         start = time.perf_counter()
         self.cache[key] = np.copy(data)
         total = time.perf_counter() - start
-        return StorageBackend.IOTiming(total=total, device=total, host=total)
+        return StorageBackend.IOTiming(total=total, device=0.0, host=total, split="host_only")
 
     def read(self, key: str) -> Tuple[np.ndarray, StorageBackend.IOTiming]:
         """Reads data by copying it from the cache dictionary."""
@@ -219,7 +227,7 @@ class CPUMemoryBackend(StorageBackend):
         start = time.perf_counter()
         data = np.copy(self.cache[key])
         total = time.perf_counter() - start
-        return data, StorageBackend.IOTiming(total=total, device=total, host=total)
+        return data, StorageBackend.IOTiming(total=total, device=0.0, host=total, split="host_only")
 
     def delete(self, key: str):
         if key in self.cache:

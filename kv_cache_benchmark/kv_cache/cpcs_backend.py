@@ -202,6 +202,9 @@ class CPCSNVMeBackend(StorageBackend):
         self._flow_read_readback_bytes_total = 0
         self._flow_workbuf_peak_bytes = 0
         self._flow_mem_requests_total = 0
+        # 09-03: the hostnvm arm's transform-kernel wall time. Measured
+        # since 08-31 but previously DROPPED (never reported).
+        self._flow_host_kernel_s_total = 0.0
         if self.kv_flow in ("pslm", "vslm"):
             self._flow_bootstrap_mrs()
 
@@ -1282,6 +1285,7 @@ class CPCSNVMeBackend(StorageBackend):
                       kv_kernels.encode(kmode, raw_payload[o:o + cap])
                       for o in range(0, len(raw_payload), cap)]
             host_kernel_s = time.perf_counter() - t0
+            self._flow_host_kernel_s_total += host_kernel_s
             pos = 0
             store_parts = []
             for piece, o in zip(pieces, range(0, len(raw_payload), cap)):
@@ -1385,8 +1389,10 @@ class CPCSNVMeBackend(StorageBackend):
             req_workbuf, len(raw_payload))
         end = time.perf_counter()
         host_time = (end - start) - device_time
-        return StorageBackend.IOTiming(total=end - start, device=device_time,
-                                       host=host_time)
+        return StorageBackend.IOTiming(
+            total=end - start, device=device_time, host=host_time,
+            components=({"host_kernel": host_kernel_s}
+                        if host_kernel_s > 0 else None))
 
     def _flow_read(self, key: str) -> Tuple[np.ndarray, StorageBackend.IOTiming]:
         from . import kv_kernels
@@ -1418,7 +1424,10 @@ class CPCSNVMeBackend(StorageBackend):
                     store_nsid, store_off + int(c["rel_off"]),
                     int(c["packed_len"]), mmode)
             if self.kv_flow == "hostnvm":
-                out_parts.append(kv_kernels.decode(kmode, packed))
+                t0 = time.perf_counter()
+                decoded_piece = kv_kernels.decode(kmode, packed)
+                self._flow_host_kernel_s_total += time.perf_counter() - t0
+                out_parts.append(decoded_piece)
                 continue
             prof = self._command_profile(phase="read", key=key, mode=kmode,
                                          payload_bytes=len(packed))
@@ -1675,9 +1684,11 @@ class CPCSNVMeBackend(StorageBackend):
         persist_device_time = self._store_packed_payload(key, packed_payload, meta)
         end = time.perf_counter()
 
-        host_time = (post_serialize - start) + (end - post_serialize)
-        device_time = persist_device_time + command_latency
         total = end - start
+        device_time = persist_device_time + command_latency
+        # 09-03: host is the REMAINDER of the wall, not the whole wall --
+        # the old arithmetic double-counted (device + host > total).
+        host_time = max(0.0, total - device_time)
         return StorageBackend.IOTiming(total=total, device=device_time, host=host_time)
 
     def read(self, key: str) -> Tuple[np.ndarray, StorageBackend.IOTiming]:
@@ -1738,10 +1749,14 @@ class CPCSNVMeBackend(StorageBackend):
                 if expected >= 0 and actual != expected:
                     raise ValueError(f"CPCS checksum mismatch for key {key}: expected={expected} actual={actual}")
 
-        host_time = disk_time + max(0.0, (end - start - disk_time))
-        device_time = float(result.command_latency_s)
         total = end - start
-        return data, StorageBackend.IOTiming(total=total, device=device_time, host=host_time)
+        device_time = float(result.command_latency_s)
+        # 09-03: same double-count fix as write; the payload disk/arena
+        # read stays host-side but is disclosed as a component.
+        host_time = max(0.0, total - device_time)
+        return data, StorageBackend.IOTiming(
+            total=total, device=device_time, host=host_time,
+            components={"nvm_io": float(disk_time)})
 
     def supports_batch_read(self) -> bool:
         return self.batch_size > 1 or self.mode in {"layout", "block_select", "prefix_index"} or self.storage_mode == "arena"
@@ -1805,6 +1820,8 @@ class CPCSNVMeBackend(StorageBackend):
             self._flow_read_readback_bytes_total)
         summary["cpcs_flow_workbuf_peak_bytes"] = int(self._flow_workbuf_peak_bytes)
         summary["cpcs_flow_mem_requests_total"] = int(self._flow_mem_requests_total)
+        summary["cpcs_flow_host_kernel_s_total"] = float(
+            self._flow_host_kernel_s_total)
         summary["cpcs_flow_rsids"] = int(self.kv_flow_rsids)
         if self.bootstrap_status:
             summary["cpcs_bootstrap"] = dict(self.bootstrap_status)
@@ -1823,6 +1840,7 @@ class CPCSNVMeBackend(StorageBackend):
         self._flow_read_readback_bytes_total = 0
         self._flow_workbuf_peak_bytes = 0
         self._flow_mem_requests_total = 0
+        self._flow_host_kernel_s_total = 0.0
 
     def __del__(self):
         try:
