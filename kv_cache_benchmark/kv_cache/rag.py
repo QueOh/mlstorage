@@ -5,6 +5,7 @@ Simulates document ingestion, chunking, and retrieval patterns that
 stress the cache with large context sizes and unique I/O patterns.
 """
 
+import hashlib
 import random
 import logging
 import threading
@@ -13,6 +14,11 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
 import numpy as np
+
+# 09-03 (S5): dimensionality of the deterministic per-chunk embeddings
+# used by REAL retrieval; matches the eval-family vector layout the
+# device arm (filtered_topk_exact, PIND 6) will scan in P3.
+RAG_EMBED_DIM = 64
 
 from kv_cache.config import cfg
 from kv_cache.models import ModelConfig, InferenceRequest
@@ -42,6 +48,9 @@ class RAGDocument:
     total_tokens: int
     chunk_size: int
     chunks: List[RAGChunk] = field(default_factory=list)
+    # 09-03 (S5): (num_chunks x RAG_EMBED_DIM) float32, unit-normalized,
+    # deterministic per (doc_id, chunk_idx). None in legacy ('off') mode.
+    embeddings: Optional[np.ndarray] = None
 
     @property
     def num_chunks(self) -> int:
@@ -68,7 +77,12 @@ class RAGDocumentManager:
     # Supported retrieval distributions
     DISTRIBUTIONS = ('zipfian', 'uniform', 'random')
 
-    def __init__(self, cache, chunk_size: int = None, top_k_chunks: int = None):
+    def __init__(self, cache, chunk_size: int = None, top_k_chunks: int = None,
+                 mode: str = 'off'):
+        # offload-stages s5: 'off' = legacy RNG chooser (continuity cells
+        # only), 'host' = real embedding top-k on the host, 'device'
+        # lands with P3 (PIND 6 scan; until then it scores host-side).
+        self.mode = str(mode or 'off')
         self.cache = cache
         self.chunk_size = chunk_size if chunk_size is not None else cfg('rag', 'chunk_size_tokens', default=512)
         self.top_k_chunks = top_k_chunks if top_k_chunks is not None else cfg('rag', 'top_k_chunks', default=5)
@@ -147,6 +161,11 @@ class RAGDocumentManager:
             doc.chunks.append(chunk)
             self.chunk_index[chunk.chunk_id] = chunk
 
+        if self.mode in ('host', 'device') and doc.chunks:
+            doc.embeddings = np.stack(
+                [self._chunk_embedding(doc_id, c.chunk_index)
+                 for c in doc.chunks])
+
         with self.lock:
             # Evict oldest documents if we've hit the limit
             if self.max_documents > 0:
@@ -206,13 +225,47 @@ class RAGDocumentManager:
             # Fallback to uniform
             return None
 
-    def retrieve_chunks(self, doc_id: str) -> List[RAGChunk]:
-        """
-        Simulates the retrieval of the top-k most relevant chunks for a query.
+    @staticmethod
+    def _chunk_embedding(doc_id: str, chunk_idx: int) -> np.ndarray:
+        """Deterministic unit-norm embedding for one chunk (seeded from
+        content identity, never from call order)."""
+        seed = int.from_bytes(hashlib.sha256(
+            f"ragemb_{doc_id}_{chunk_idx}".encode()).digest()[:8], "little")
+        rng = np.random.default_rng(seed)
+        v = rng.standard_normal(RAG_EMBED_DIM).astype(np.float32)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 0 else v
 
-        The chunk selection distribution is configurable via 'rag.retrieval_distribution':
-        - 'zipfian': Earlier chunks more likely (realistic)
-        - 'uniform'/'random': All chunks equally likely
+    @staticmethod
+    def query_embedding(query_seed: int) -> np.ndarray:
+        """Deterministic unit-norm query vector for a given seed."""
+        rng = np.random.default_rng(int(query_seed) & 0xFFFFFFFFFFFFFFFF)
+        v = rng.standard_normal(RAG_EMBED_DIM).astype(np.float32)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 0 else v
+
+    @staticmethod
+    def topk_host(embeddings: np.ndarray, query: np.ndarray,
+                  k: int) -> List[int]:
+        """The S5 HOST ARM: dot-product scores + top-k, deterministic
+        tie-break by lower chunk index. Also the ground truth the device
+        arm's result-set equality gate compares against (P3)."""
+        scores = embeddings @ query
+        k = min(k, len(scores))
+        # sort by (-score, index): stable, tie-broken by index
+        order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+        return order[:k]
+
+    def retrieve_chunks(self, doc_id: str,
+                        query_seed: Optional[int] = None) -> List[RAGChunk]:
+        """
+        Retrieval of the top-k most relevant chunks for a query.
+
+        mode 'off' (legacy, continuity cells only): RNG chooser with the
+        configured distribution -- NOT content scoring.
+        mode 'host'/'device': REAL retrieval -- deterministic embeddings,
+        dot-product scoring, exact top-k ('device' scores host-side until
+        the P3 PIND-6 wiring lands).
         """
         with self.lock:
             if doc_id not in self.documents:
@@ -220,14 +273,20 @@ class RAGDocumentManager:
             doc = self.documents[doc_id]
             self.stats['retrieval_requests'] += 1
 
-        chunk_probabilities = self._compute_chunk_probabilities(len(doc.chunks))
-
-        retrieved_indices = np.random.choice(
-            len(doc.chunks),
-            size=min(self.top_k_chunks, len(doc.chunks)),
-            replace=False,
-            p=chunk_probabilities
-        )
+        if self.mode in ('host', 'device') and doc.embeddings is not None:
+            qseed = (query_seed if query_seed is not None
+                     else random.getrandbits(32))
+            query = self.query_embedding(qseed)
+            retrieved_indices = self.topk_host(
+                doc.embeddings, query, self.top_k_chunks)
+        else:
+            chunk_probabilities = self._compute_chunk_probabilities(len(doc.chunks))
+            retrieved_indices = np.random.choice(
+                len(doc.chunks),
+                size=min(self.top_k_chunks, len(doc.chunks)),
+                replace=False,
+                p=chunk_probabilities
+            )
 
         retrieved_chunks = [doc.chunks[i] for i in retrieved_indices]
 

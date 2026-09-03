@@ -10,6 +10,7 @@ import json
 import random
 import logging
 import argparse
+import time
 from datetime import datetime
 from dataclasses import is_dataclass, asdict
 from typing import Dict
@@ -317,6 +318,43 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
             logger.error(f"Failed to save results: {e2}")
 
 
+def _feasibility_gates(results, wall_s):
+    """Pass/fail gates for --feasibility (09-03). Coverage: every request
+    stage ran; demotions fired; attribution sound; zero thread errors;
+    bounded wall. Determinism across two same-seed runs is checked by the
+    CALLER (run twice, compare gate counters) -- not in-process."""
+    summary = results.get('summary') or {}
+    sb = summary.get('stage_breakdown') or {}
+    stages = sb.get('stages') or {}
+    gates = {}
+
+    def g(name, ok, observed):
+        gates[name] = {'pass': bool(ok), 'observed': observed}
+
+    for st in ('prefix', 'multi_turn', 'prefill', 'decode', 'rag'):
+        n = int((stages.get(st) or {}).get('count') or 0)
+        g(f'stage_{st}_ran', n > 0, n)
+    dn = int((stages.get('demotion') or {}).get('count') or 0)
+    g('demotions_fired', dn >= 5, dn)
+    viol = int(sb.get('timing_invariant_violations') or 0)
+    g('timing_invariants', viol == 0, viol)
+    proc = float(sb.get('process_cpu_s_window') or 0.0)
+    unattr = float(sb.get('unattributed_cpu_s') or 0.0)
+    frac = (unattr / proc) if proc > 0 else 0.0
+    # Sound when the share is small OR the absolute leak is trivial: in
+    # logical mode total CPU is tiny, so fixed harness overhead (request
+    # generation, monitor, queue ops) can be a large SHARE of almost
+    # nothing (calibrated 09-03: 0.19 s over 400 requests = 24.7%).
+    g('attribution_sound', frac < 0.20 or unattr < 1.0,
+      {'share': round(frac, 4), 'unattributed_s': round(unattr, 3)})
+    terr = int(summary.get('thread_error_count') or 0)
+    g('zero_thread_errors', terr == 0, terr)
+    g('wall_under_5min', wall_s <= 300.0, round(wall_s, 1))
+    gates['all_pass'] = all(v['pass'] for v in gates.values()
+                            if isinstance(v, dict))
+    return gates
+
+
 def main():
     """Main entry point for running the benchmark from the command line."""
     # Hang forensics (08-24): KVBENCH_STACKDUMP_SEC=N dumps every thread's
@@ -369,6 +407,22 @@ def main():
                              'nvme-tcp connection (ioctl per command) instead of a '
                              'fresh spdk_nvme_passthru process per command (~300-430 ms '
                              'spawn tax). Needs root + nvme-cli. Rows are a NEW vintage.')
+    parser.add_argument('--offload-stages', type=str, default='',
+                        help='Per-stage offload toggles, e.g. "s2=host,s4=host". Stages: '
+                             's2 decode selective reads, s3 demotion migration, s4 batch '
+                             'gather, s5 RAG retrieval, s6 prefix lookup. Modes: off '
+                             '(legacy continuity behavior) | host (real host arm) | device '
+                             '(P3; rejected until wired). Unlisted stages = off.')
+    parser.add_argument('--decode-read-policy', type=str, default='full',
+                        help='Decode-stage read policy: full (whole block, default) or '
+                             'tail:F (read only the trailing fraction F of the block\'s '
+                             'raw bytes, 0<F<=1). Applies to BOTH arms; a disclosed '
+                             'config column, never pooled with full-policy rows.')
+    parser.add_argument('--feasibility', action='store_true',
+                        help='Feasibility preset: a deterministic 2-5 min run exercising '
+                             'every stage (tiny tiers force demotions), with pass/fail '
+                             'gates printed and a nonzero exit on any FAIL. Explicit '
+                             'flags override preset values.')
     parser.add_argument('--kv-flow-rsids', type=int, default=1,
                         help='A1W per-worker RSIDs: N disjoint MRSes so N executes run '
                              'concurrently on device compute threads (firmware leases are '
@@ -584,7 +638,28 @@ def main():
     parser.add_argument('--enable-latency-tracing', action='store_true',
                         help='Enable bpftrace device latency tracing (requires sudo, bpftrace).')
 
-    args = parser.parse_args()
+    # 09-03: --feasibility is a PRESET prepended to argv so explicit user
+    # flags win (argparse last-occurrence). Deterministic small-complete
+    # run: tiny tiers force demotions/evictions within seconds; every
+    # stage runs its real host arm.
+    argv = sys.argv[1:]
+    if '--feasibility' in argv:
+        preset = [
+            # num-users 1: deterministic gate counters need a single
+            # worker -- concurrent threads consume the shared RNG in
+            # scheduling order (verified 09-03: 4 workers gave 943 vs
+            # 856 demotions across two same-seed runs). Nights cover
+            # concurrency; feasibility gates coverage + correctness.
+            '--duration', '150', '--num-users', '1', '--max-requests', '400',
+            '--seed', '1234', '--generation-mode', 'none',
+            '--gpu-mem-gb', '0.5', '--cpu-mem-gb', '1',
+            '--storage-capacity-gb', '2', '--max-conversations', '8',
+            '--request-rate', '0', '--enable-rag',
+            '--offload-stages', 's2=host,s3=host,s4=host,s5=host,s6=host',
+            '--decode-read-policy', 'tail:0.5',
+        ]
+        argv = preset + argv
+    args = parser.parse_args(argv)
 
     # Validate mutually exclusive flags
     if args.prefill_only and args.decode_only:
@@ -698,6 +773,8 @@ def main():
     gen_mode = GenerationMode(args.generation_mode)
     cpcs_config = {
         'mode': args.cpcs_mode,
+        'offload_stages': dict(getattr(args, 'offload_stages_parsed', {}) or {}),
+        'decode_read_policy': str(getattr(args, 'decode_read_policy', 'full')),
         'client': args.cpcs_client,
         'storage_mode': args.cpcs_storage_mode,
         'spdk_rpc_script': args.spdk_rpc_script,
@@ -824,8 +901,12 @@ def main():
         enable_latency_tracing=args.enable_latency_tracing
     )
 
+    _t_run0 = time.perf_counter()
     results = benchmark.run()
+    _run_wall_s = time.perf_counter() - _t_run0
     results.setdefault('metadata', {})
+    if args.feasibility:
+        results['feasibility_gates'] = _feasibility_gates(results, _run_wall_s)
     results['metadata']['nvme_backend'] = args.nvme_backend
     results['metadata']['cpcs'] = {
         'enabled': args.nvme_backend == 'cpcs',
@@ -940,6 +1021,24 @@ def main():
         print("FATAL: zero requests completed and worker threads raised -- failing run",
               file=sys.stderr)
         sys.exit(3)
+
+    # 09-03: feasibility verdict -- printed AFTER results are persisted so
+    # a FAIL still leaves full evidence on disk; nonzero exit gates any
+    # full sweep on this configuration.
+    if args.feasibility:
+        gates = results.get('feasibility_gates') or {}
+        print("\n" + "=" * 60)
+        print("FEASIBILITY GATES")
+        print("=" * 60)
+        for name, gate in gates.items():
+            if not isinstance(gate, dict):
+                continue
+            mark = "PASS" if gate.get('pass') else "FAIL"
+            print(f"  {mark}  {name:<24} observed={gate.get('observed')}")
+        verdict = bool(gates.get('all_pass'))
+        print(f"FEASIBILITY VERDICT: {'PASS' if verdict else 'FAIL'}")
+        if not verdict:
+            sys.exit(4)
 
     if args.xlsx_output:
         export_results_to_xlsx(results, args, args.xlsx_output)

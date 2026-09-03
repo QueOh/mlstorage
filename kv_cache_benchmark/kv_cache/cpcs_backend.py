@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from kv_cache import stage_metrics
 from kv_cache.backends import StorageBackend
 from kv_cache.cpcs_client import CPCSClient, KernelChannelCPCSClient, MockCPCSClient, SpdkPassthruCPCSClient, SpdkRpcBootstrap
 from kv_cache.cpcs_metrics import CPCSMetrics
@@ -205,6 +206,11 @@ class CPCSNVMeBackend(StorageBackend):
         # 09-03: the hostnvm arm's transform-kernel wall time. Measured
         # since 08-31 but previously DROPPED (never reported).
         self._flow_host_kernel_s_total = 0.0
+        # 09-03: per-stage offload toggles + decode read policy (S2/S4).
+        self.offload_stages = dict(
+            (cpcs_config or {}).get('offload_stages') or {})
+        self.decode_read_policy = str(
+            (cpcs_config or {}).get('decode_read_policy') or 'full')
         if self.kv_flow in ("pslm", "vslm"):
             self._flow_bootstrap_mrs()
 
@@ -1289,8 +1295,13 @@ class CPCSNVMeBackend(StorageBackend):
             pos = 0
             store_parts = []
             for piece, o in zip(pieces, range(0, len(raw_payload), cap)):
+                # per-chunk crc (09-03): selective reads (tail policy)
+                # cannot verify the whole-block checksum, so each chunk
+                # carries its own. Old records without it skip per-chunk
+                # verification (back-compat, disclosed).
                 chunks.append({"packed_len": len(piece), "rel_off": pos,
-                               "raw_len": min(cap, len(raw_payload) - o)})
+                               "raw_len": min(cap, len(raw_payload) - o),
+                               "crc": int(zlib.crc32(piece) & 0xFFFFFFFF)})
                 store_parts.append(piece)
                 pos += len(piece)
             packed_all = b"".join(store_parts)
@@ -1414,7 +1425,21 @@ class CPCSNVMeBackend(StorageBackend):
         store_off = int(meta.get("store_off", 0))
         arena_base = self.kv_scratch_bytes  # vslm range-2 namespace offset
 
-        for c in meta["chunks"]:
+        # S2 (09-03): decode-stage selective reads. tail:F reads only the
+        # trailing chunks covering >= F of the block's raw bytes -- the
+        # decode semantics need the most recent tokens' KV. Applies ONLY
+        # to decode-stage reads (stage tag) with s2 enabled; multi-turn/
+        # rag/verification reads stay full. Disclosed config column.
+        sel_chunks = list(meta["chunks"])
+        partial = False
+        if (self.decode_read_policy.startswith("tail:")
+                and self.offload_stages.get("s2") in ("host", "device")
+                and stage_metrics.current_stage() == "decode"):
+            frac = float(self.decode_read_policy.split(":", 1)[1])
+            sel_chunks = self._select_tail_chunks(sel_chunks, frac)
+            partial = len(sel_chunks) != len(meta["chunks"])
+
+        for c in sel_chunks:
             if self.kv_flow == "vslm":
                 packed = self._flow_store_read(
                     self.slm_nsid, arena_base + int(c["rel_off"]),
@@ -1423,6 +1448,9 @@ class CPCSNVMeBackend(StorageBackend):
                 packed = self._flow_store_read(
                     store_nsid, store_off + int(c["rel_off"]),
                     int(c["packed_len"]), mmode)
+            if "crc" in c and (zlib.crc32(packed) & 0xFFFFFFFF) != int(c["crc"]):
+                raise IOError(f"kv_flow chunk crc mismatch for {key} "
+                              f"rel_off={c['rel_off']}")
             if self.kv_flow == "hostnvm":
                 t0 = time.perf_counter()
                 decoded_piece = kv_kernels.decode(kmode, packed)
@@ -1446,15 +1474,37 @@ class CPCSNVMeBackend(StorageBackend):
             self._flow_read_readback_bytes_total += r["out_len"]
             out_parts.append(decoded)
         raw = b"".join(out_parts)
-        if kmode != "int8_quantize":
-            if (zlib.crc32(raw) & 0xFFFFFFFF) != int(meta.get("checksum", 0)):
-                raise IOError(f"kv_flow read checksum mismatch for {key}")
-        arr = np.frombuffer(raw, dtype=np.dtype(str(meta["dtype"])))
-        arr = arr.reshape([int(x) for x in meta["shape"]]).copy()
+        if partial:
+            # tail read: whole-block checksum/shape are unavailable by
+            # construction (per-chunk crcs verified above); the decode
+            # consumer discards the data, so return the flat tail.
+            arr = np.frombuffer(raw, dtype=np.dtype(str(meta["dtype"]))).copy()
+        else:
+            if kmode != "int8_quantize":
+                if (zlib.crc32(raw) & 0xFFFFFFFF) != int(meta.get("checksum", 0)):
+                    raise IOError(f"kv_flow read checksum mismatch for {key}")
+            arr = np.frombuffer(raw, dtype=np.dtype(str(meta["dtype"])))
+            arr = arr.reshape([int(x) for x in meta["shape"]]).copy()
         end = time.perf_counter()
         return arr, StorageBackend.IOTiming(
             total=end - start, device=device_time,
             host=(end - start) - device_time)
+
+    @staticmethod
+    def _select_tail_chunks(chunks: List[Dict[str, Any]],
+                            frac: float) -> List[Dict[str, Any]]:
+        """Minimal trailing chunk set covering >= frac of the raw bytes
+        (order preserved). Pure helper -- unit-tested directly."""
+        total_raw = sum(int(c["raw_len"]) for c in chunks)
+        need = max(1, int(frac * total_raw))
+        got = 0
+        picked: List[Dict[str, Any]] = []
+        for c in reversed(list(chunks)):
+            picked.append(c)
+            got += int(c["raw_len"])
+            if got >= need:
+                break
+        return list(reversed(picked))
 
     def _store_packed_payload(self, key: str, packed_payload: bytes, meta: Dict[str, Any]) -> float:
         """
@@ -1762,11 +1812,25 @@ class CPCSNVMeBackend(StorageBackend):
         return self.batch_size > 1 or self.mode in {"layout", "block_select", "prefix_index"} or self.storage_mode == "arena"
 
     def read_many(self, keys: List[str]) -> Dict[str, Tuple[np.ndarray, StorageBackend.IOTiming]]:
-        self._issue_batch_descriptor([str(k) for k in keys])
-        out: Dict[str, Tuple[np.ndarray, StorageBackend.IOTiming]] = {}
-        for key in keys:
-            out[key] = self.read(str(key))
-        return out
+        ks = [str(k) for k in keys]
+        self._issue_batch_descriptor(ks)
+        # S4 host arm (09-03): coalesced issue order -- ascending storage
+        # offset for sequential locality. The host cannot merge commands
+        # across the flow protocol; the TRUE single-command device gather
+        # (PIND 12 cparam1=1) lands with P3. Result dict preserves caller
+        # key order either way.
+        if self.offload_stages.get("s4") in ("host", "device"):
+            def _off(k: str):
+                m = self.metadata.get(k) or {}
+                return (int(m.get("store_nsid", 0) or 0),
+                        int(m.get("store_off", 0) or 0))
+            ordered = sorted(ks, key=_off)
+        else:
+            ordered = ks
+        got: Dict[str, Tuple[np.ndarray, StorageBackend.IOTiming]] = {}
+        for key in ordered:
+            got[key] = self.read(key)
+        return {k: got[k] for k in ks}
 
     def delete(self, key: str):
         self._flow_reclaim(key)

@@ -125,6 +125,62 @@ FORBIDDEN_CACHE_PREFIXES = frozenset([
 ])
 
 
+OFFLOAD_STAGE_KEYS = ('s2', 's3', 's4', 's5', 's6')
+OFFLOAD_STAGE_VALUES = ('off', 'host', 'device')
+
+
+def parse_offload_stages(spec: str) -> Dict[str, str]:
+    """Parse "s2=host,s4=device,..." into a full {stage: mode} dict.
+
+    Unlisted stages default to 'off' (legacy behavior). Raises
+    ValueError on unknown stages/modes. 'device' values are rejected
+    until the P3 device-arm plumbing lands -- failing loudly beats
+    silently measuring a host arm labeled device.
+    """
+    out = {k: 'off' for k in OFFLOAD_STAGE_KEYS}
+    spec = (spec or '').strip()
+    if not spec:
+        return out
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '=' not in part:
+            raise ValueError(f"--offload-stages entry '{part}' is not "
+                             f"stage=mode")
+        k, v = (x.strip().lower() for x in part.split('=', 1))
+        if k not in OFFLOAD_STAGE_KEYS:
+            raise ValueError(f"--offload-stages unknown stage '{k}' "
+                             f"(known: {','.join(OFFLOAD_STAGE_KEYS)})")
+        if v not in OFFLOAD_STAGE_VALUES:
+            raise ValueError(f"--offload-stages invalid mode '{v}' for "
+                             f"{k} (off|host|device)")
+        if v == 'device':
+            raise ValueError(f"--offload-stages {k}=device: device arms "
+                             f"are not wired yet (P3); use host or off")
+        out[k] = v
+    return out
+
+
+def validate_decode_read_policy(policy: str) -> str:
+    """'full' or 'tail:F' with 0 < F <= 1 (trailing fraction of the
+    block's raw bytes read on decode-stage reads)."""
+    p = (policy or 'full').strip().lower()
+    if p == 'full':
+        return p
+    if p.startswith('tail:'):
+        try:
+            frac = float(p.split(':', 1)[1])
+        except ValueError:
+            raise ValueError(f"--decode-read-policy '{policy}': tail "
+                             f"fraction is not a number")
+        if not (0.0 < frac <= 1.0):
+            raise ValueError(f"--decode-read-policy tail fraction must be "
+                             f"in (0, 1], got {frac}")
+        return p
+    raise ValueError(f"--decode-read-policy '{policy}' (full | tail:F)")
+
+
 def _validate_mrs_ranges_spec(spec: str) -> None:
     def _to_int(v) -> int:
         if isinstance(v, bool):
@@ -181,6 +237,21 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         ValueError: If any validation check fails
     """
     errors = []
+
+    # 09-03: stage-offload toggles + decode read policy. Parsed once
+    # here; downstream consumers read the normalized forms.
+    try:
+        args.offload_stages_parsed = parse_offload_stages(
+            getattr(args, 'offload_stages', '') or '')
+    except ValueError as exc:
+        errors.append(str(exc))
+        args.offload_stages_parsed = parse_offload_stages('')
+    try:
+        args.decode_read_policy = validate_decode_read_policy(
+            getattr(args, 'decode_read_policy', 'full') or 'full')
+    except ValueError as exc:
+        errors.append(str(exc))
+        args.decode_read_policy = 'full'
 
     if args.num_users <= 0:
         errors.append(f"--num-users must be positive, got {args.num_users}")

@@ -179,8 +179,17 @@ class IntegratedBenchmark:
             io_tracer=self.io_tracer,
         )
         self.conversation_manager = ConversationManager()
-        self.prefix_cache_manager = PrefixCacheManager(self.cache) if enable_prefix_caching else None
-        self.rag_manager = RAGDocumentManager(self.cache) if enable_rag else None
+        # 09-03: per-stage offload toggles ride cpcs_config end-to-end.
+        self.offload_stages = dict(
+            self.cpcs_config.get('offload_stages') or {})
+        self.decode_read_policy = str(
+            self.cpcs_config.get('decode_read_policy') or 'full')
+        self.prefix_cache_manager = PrefixCacheManager(
+            self.cache, mode=self.offload_stages.get('s6', 'off')
+        ) if enable_prefix_caching else None
+        self.rag_manager = RAGDocumentManager(
+            self.cache, mode=self.offload_stages.get('s5', 'off')
+        ) if enable_rag else None
         self.qos_monitor = QoSMonitor()
         self.storage_monitor = StorageMonitor(self) if enable_autoscaling else None
         self.system_metrics_tracker = SystemMetricsTracker()
@@ -468,7 +477,11 @@ class IntegratedBenchmark:
     def generate_requests(self, users: List[UserProfile], stop_event: threading.Event):
         """Generate requests concurrently for each simulated user."""
 
-        if self.enable_rag and self.rag_manager and self.rag_ingest_done:
+        # 09-03: ingest normally already happened synchronously in run()
+        # (setup phase); this launch survives only as a fallback for
+        # direct generate_requests() callers (e.g. unit tests).
+        if (self.enable_rag and self.rag_manager and self.rag_ingest_done
+                and not self.rag_ingest_done.is_set()):
             threading.Thread(
                 target=self._ingest_rag_documents,
                 args=(self.rag_num_docs, stop_event),
@@ -629,12 +642,17 @@ class IntegratedBenchmark:
                     with self.results_lock: self.results['prefill_latencies'].append(write_latency)
 
             # 4. Simulate a RAG operation.
-            if self.rag_manager and random.random() < cfg('rag', 'request_probability', default=0.1):
+            # 09-03: RAG fire/doc/query decisions are seeded PER REQUEST so
+            # they do not depend on cross-thread RNG consumption order
+            # (the global-RNG draw order varies with scheduling).
+            _rag_rng = random.Random(f"rag_{request.request_id}_{self.seed}")
+            if self.rag_manager and _rag_rng.random() < cfg('rag', 'request_probability', default=0.1):
                 with stage_metrics.stage('rag'):
-                    doc_keys = list(self.rag_manager.documents.keys()) if self.rag_manager.documents else []
+                    doc_keys = sorted(self.rag_manager.documents.keys()) if self.rag_manager.documents else []
                     if doc_keys:
-                        doc_id = random.choice(doc_keys)
-                        chunks = self.rag_manager.retrieve_chunks(doc_id)
+                        doc_id = _rag_rng.choice(doc_keys)
+                        chunks = self.rag_manager.retrieve_chunks(
+                            doc_id, query_seed=_rag_rng.getrandbits(32))
                         rag_keys = [chunk.kv_cache_key for chunk in chunks]
                         for _, _, read_lat in self.cache.access_cache_many(rag_keys, InferencePhase.DECODE):
                             storage_latency += read_lat
@@ -1288,6 +1306,21 @@ class IntegratedBenchmark:
         stop_event = threading.Event()
         self.stop_event = stop_event
 
+        # 09-03: RAG ingest is SETUP, not measured workload -- run it
+        # synchronously BEFORE the attribution window opens. The old
+        # background-thread ingest (launched inside generate_requests)
+        # interleaved nondeterministically with serving, made demotion
+        # counts irreproducible across same-seed runs (943 vs 856), and
+        # charged ingest-triggered demotions to the measured window.
+        if (self.enable_rag and self.rag_manager and self.rag_ingest_done
+                and not self.rag_ingest_done.is_set()):
+            self._ingest_rag_documents(self.rag_num_docs)
+
+        # 09-03: the attribution window opens HERE -- after preconditioning
+        # and prepopulation -- so imports/fill phases never count against
+        # the per-stage or unattributed CPU columns.
+        stage_metrics.reset()
+
         threads = []
         if self.use_dataset:
             gen_thread = threading.Thread(target=self._generate_requests_from_dataset, args=(stop_event,), daemon=True)
@@ -1596,7 +1629,10 @@ class IntegratedBenchmark:
             self.results.get('prefill_latencies') or [])
         summary['decode_latency_s'] = _series_stats(
             self.results.get('decode_latencies') or [])
-        summary['stage_breakdown'] = stage_metrics.snapshot()
+        summary['stage_breakdown'] = stage_metrics.snapshot(
+            toggles={**getattr(self, 'offload_stages', {}),
+                     'decode_read_policy': getattr(self, 'decode_read_policy',
+                                                   'full')})
         self.results['summary'] = summary
         if self.latency_dump and self._latency_dump_records is not None:
             with self.results_lock:
