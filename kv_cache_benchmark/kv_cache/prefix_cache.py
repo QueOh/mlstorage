@@ -193,8 +193,51 @@ class PrefixCacheManager:
             'prefix_misses': 0,
             'system_prompt_reuse': 0,
             'common_phrase_reuse': 0,
-            'bytes_saved': 0
+            'bytes_saved': 0,
+            'device_lookups': 0,
+            'device_parity_mismatches': 0,
+            'device_lookup_errors': 0,
         }
+        # device-arm publish state: re-publish the 32B-record image only
+        # when the index grew (register-on-miss marks it dirty).
+        self._published_index_size = -1
+
+    def _device_lookup_parity(self, request, host_entry) -> None:
+        """S6 device arm (P3): run the SAME lookup on the device (PIND 11
+        scan over the published index image) and count parity against the
+        host result. Errors fall back silently to the host result but are
+        counted -- never hidden."""
+        backend = getattr(self.cache, 'backends', {}).get('nvme')
+        lookup = getattr(backend, 'prefix_lookup_device', None)
+        if lookup is None:
+            return
+        m = self.prefix_matcher
+        try:
+            with self.lock:
+                index_size = len(m.prefix_index)
+            if index_size != self._published_index_size:
+                image = m.publish_records()
+            else:
+                image = None
+            sys_tokens = 128
+            chain = m._prompt_chain(
+                m._user_prompt_id(str(getattr(request, 'user_id', ''))),
+                sys_tokens)
+            if image is not None:
+                matches = lookup(image, chain)
+                self._published_index_size = index_size
+            else:
+                matches = lookup(m.publish_records(), chain)
+            with self.lock:
+                self.stats['device_lookups'] += 1
+                # host registered-on-miss BEFORE this scan ran, so a
+                # device hit on a host miss is expected first-sight
+                # behavior; the defect signal is host HIT + device empty.
+                if host_entry is not None and not matches:
+                    self.stats['device_parity_mismatches'] += 1
+        except Exception:
+            with self.lock:
+                self.stats['device_lookup_errors'] += 1
 
     def check_prefix_cache(self, request: InferenceRequest, model_config: ModelConfig) -> Tuple[Optional[PrefixCacheEntry], int]:
         """
@@ -212,6 +255,8 @@ class PrefixCacheManager:
         if self.mode in ('host', 'device'):
             prefix_entry = self.prefix_matcher.detect_system_prompt_real(
                 str(getattr(request, 'user_id', '')))
+            if self.mode == 'device':
+                self._device_lookup_parity(request, prefix_entry)
         else:
             prefix_entry = self.prefix_matcher.detect_system_prompt(request.context_tokens)
 

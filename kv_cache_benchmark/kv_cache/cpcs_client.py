@@ -884,6 +884,14 @@ class SpdkPassthruCPCSClient(CPCSClient):
                 "--input-file",
                 path,
             ]
+            # 09-03 (stage-offload vintage): cparam1 rides CDW10-11 and
+            # selects the firmware's SLM-source path (1) for the
+            # select/gather/index-scan builtins; 0 = legacy, no flags
+            # emitted so old command lines stay byte-identical.
+            cparam1 = int(kwargs.get("cparam1", 0) or 0)
+            if cparam1:
+                cmd += ["--cdw10", str(cparam1 & 0xFFFFFFFF),
+                        "--cdw11", str((cparam1 >> 32) & 0xFFFFFFFF)]
             # Bounded retry on MEMORY_RANGE_SET_IN_USE (01/95): the firmware
             # leases the whole RSID per execute, and although the backend
             # serializes its own executes, a lease can outlive the command

@@ -263,6 +263,7 @@ class IntegratedBenchmark:
                 break
             doc_tokens = random.randint(token_min, token_max)
             self.rag_manager.ingest_document(f"doc_{i:04d}", doc_tokens, self.model_config)
+            logger.info(f"RAG ingest {i + 1}/{num_docs} ({doc_tokens} tokens)")
 
         if self.rag_ingest_done:
             self.rag_ingest_done.set()

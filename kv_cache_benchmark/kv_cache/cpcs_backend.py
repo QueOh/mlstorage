@@ -13,6 +13,7 @@ import logging
 import os
 import tempfile
 import time
+import struct
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +38,7 @@ class CPCSNVMeBackend(StorageBackend):
         "block_select": 10,
         "prefix_lookup": 11,
         "batch_read": 12,
+        "migrate": 13,
     }
 
     def __init__(self, base_path: Optional[str], cpcs_config: Optional[Dict[str, Any]] = None):
@@ -211,6 +213,11 @@ class CPCSNVMeBackend(StorageBackend):
             (cpcs_config or {}).get('offload_stages') or {})
         self.decode_read_policy = str(
             (cpcs_config or {}).get('decode_read_policy') or 'full')
+        # SLM-source device-path accounting (P3): executes taken, and
+        # graceful fallbacks to the per-chunk host path (each logged).
+        self._slm_device_execs = 0
+        self._slm_device_fallbacks = 0
+        self._batch_local = _threading.local()
         if self.kv_flow in ("pslm", "vslm"):
             self._flow_bootstrap_mrs()
 
@@ -1439,6 +1446,43 @@ class CPCSNVMeBackend(StorageBackend):
             sel_chunks = self._select_tail_chunks(sel_chunks, frac)
             partial = len(sel_chunks) != len(meta["chunks"])
 
+        # Device SLM-source path (P3): ONE select+decode execute per slot
+        # group instead of per-chunk read+execute. Taken for decode-stage
+        # partial reads (s2=device) and batch reads (s4=device), vslm
+        # only. Any failure falls back to the per-chunk path, counted.
+        in_batch = bool(getattr(self._batch_local, "active", False))
+        want_device = (
+            self.kv_flow == "vslm"
+            and ((partial and self.offload_stages.get("s2") == "device")
+                 or (in_batch and self.offload_stages.get("s4") == "device")))
+        if want_device:
+            try:
+                raw, dev_s = self._flow_device_select_read(
+                    sel_chunks, kmode, mmode)
+                device_time += dev_s
+                if partial:
+                    arr = np.frombuffer(
+                        raw, dtype=np.dtype(str(meta["dtype"]))).copy()
+                else:
+                    if kmode != "int8_quantize":
+                        if (zlib.crc32(raw) & 0xFFFFFFFF) != int(
+                                meta.get("checksum", 0)):
+                            raise IOError(
+                                f"kv_flow device read checksum mismatch for {key}")
+                    arr = np.frombuffer(raw, dtype=np.dtype(str(meta["dtype"])))
+                    arr = arr.reshape(
+                        [int(x) for x in meta["shape"]]).copy()
+                self._flow_read_readback_bytes_total += len(raw)
+                end = time.perf_counter()
+                return arr, StorageBackend.IOTiming(
+                    total=end - start, device=device_time,
+                    host=(end - start) - device_time,
+                    components={"exec_cmd": dev_s})
+            except Exception as exc:
+                self._slm_device_fallbacks += 1
+                logger.warning(
+                    "slm device select fell back to per-chunk path: %s", exc)
+
         for c in sel_chunks:
             if self.kv_flow == "vslm":
                 packed = self._flow_store_read(
@@ -1505,6 +1549,156 @@ class CPCSNVMeBackend(StorageBackend):
             if got >= need:
                 break
         return list(reversed(picked))
+
+    # ---- SLM-source device paths (P3, stage-offload vintage) -----------
+    # Firmware ABI mirror (spdk-p2 0357b7e7b): CPCSSLM1 binary entry
+    # table riding the CPCSREQ1 payload; cparam1=1 selects the device's
+    # SLM-source engine. vslm flow ONLY: pslm's persisted chunks live in
+    # the kvstore namespace, which is outside every MRS (reachability
+    # change = operator item; typed limitation, never silently degraded).
+
+    _SLM_MAGIC = b"CPCSSLM1"
+    _SLM_OP = {"block_select": 4, "prefix_lookup": 5, "batch_read": 6,
+               "migrate": 7}
+    _SLM_TRAILER = 16
+    _KV_MODE_INT = {"off": 0, "noop": 1, "lossless_compress": 2,
+                    "int8_quantize": 3, "layout": 4}
+
+    def _slm_descriptor(self, op_name: str, entries: List[Dict[str, Any]],
+                        flags: int = 0,
+                        queries: Optional[List[int]] = None) -> bytes:
+        parts = [self._SLM_MAGIC,
+                 struct.pack("<II", self._SLM_OP[op_name], len(entries)),
+                 struct.pack("<Q", int(flags))]
+        for e in entries:
+            parts.append(struct.pack(
+                "<QQQQQII",
+                int(e.get("src_mr", 0)), int(e.get("src_off", 0)),
+                int(e.get("dst_mr", 0)), int(e.get("dst_off", 0)),
+                int(e.get("len", 0)), int(e.get("raw_len", 0)),
+                int(e.get("mode", 0))))
+        for q in (queries or []):
+            parts.append(struct.pack("<Q", int(q) & 0xFFFFFFFFFFFFFFFF))
+        return b"".join(parts)
+
+    def _slm_execute(self, op_name: str, slot: int, desc: bytes,
+                     extra: Dict[str, Any], kmode: str = "noop"):
+        rsid = (self._flow_rsids[slot] if self._flow_rsids
+                else self._flow_rsid)
+        try:
+            pind = self._resolve_program_binding(op_name)[1]
+        except Exception:
+            pind = self._SPDK_KV_BUILTIN_PIND_DEFAULTS.get(op_name, 13)
+        with self._exec_locks[slot % len(self._exec_locks)]:
+            result = self.client.execute(
+                cpcs_nsid=self.cpcs_nsid, rsid=rsid, pind=pind,
+                payload=desc, op=op_name, mode=kmode, extra=extra,
+                cparam1=1)
+        self._slm_device_execs += 1
+        raw = int(result.extra.get("result_raw",
+                                   result.extra.get("result_dw0", 0)) or 0)
+        served = int(result.extra.get("result_value",
+                                      raw & 0xFFFFFFFF) or 0)
+        return result, served
+
+    def _flow_device_select_read(self, sel_chunks: List[Dict[str, Any]],
+                                 kmode: str, mmode: str):
+        """ONE PIND-10 SLM-source execute per slot-group (device decodes
+        the selected arena chunks into the slot's scratch window) + ONE
+        window read per group. Returns (raw_bytes, device_time_s).
+        Raises on any mismatch -- the caller falls back to the per-chunk
+        path and counts the fallback."""
+        mode_int = self._KV_MODE_INT.get(kmode, 1)
+        groups: Dict[int, List[Dict[str, Any]]] = {}
+        for c in sel_chunks:
+            groups.setdefault(self._arena_slot_of(int(c["rel_off"])),
+                              []).append(c)
+        pieces: Dict[int, bytes] = {}
+        device_time = 0.0
+        for slot, chunks in sorted(groups.items()):
+            a_base, _ = self._slot_arena(slot)
+            s_base, s_len = self._slot_scratch(slot)
+            entries = [{"src_mr": 2,
+                        "src_off": int(c["rel_off"]) - a_base,
+                        "len": int(c["packed_len"]),
+                        "raw_len": int(c["raw_len"]),
+                        "mode": mode_int} for c in chunks]
+            payload_total = sum(int(c["raw_len"]) for c in chunks)
+            win_len = payload_total + len(entries) * self._SLM_TRAILER
+            if win_len > s_len:
+                raise RuntimeError(
+                    f"slm select window {win_len} exceeds scratch {s_len}")
+            desc = self._slm_descriptor("block_select", entries)
+            extra = {"output_mr_id": 1, "output_offset": 0,
+                     "output_length": int(win_len),
+                     "kv_flow": self.kv_flow, "phase": "read"}
+            result, served = self._slm_execute("block_select", slot, desc,
+                                               extra, kmode)
+            device_time += float(result.command_latency_s)
+            if served != len(entries):
+                raise RuntimeError(
+                    f"slm select served {served}/{len(entries)}")
+            window = self._flow_store_read(self.slm_nsid, s_base,
+                                           win_len, mmode)
+            tbase = payload_total
+            for i, c in enumerate(chunks):
+                t = window[tbase + i * self._SLM_TRAILER:
+                           tbase + (i + 1) * self._SLM_TRAILER]
+                rel_off, out_len, crc = struct.unpack("<III", t[:12])
+                piece = window[rel_off:rel_off + out_len]
+                if (out_len != int(c["raw_len"]) or
+                        (zlib.crc32(piece) & 0xFFFFFFFF) != crc):
+                    raise IOError("slm select trailer/crc mismatch")
+                pieces[id(c)] = piece
+        raw = b"".join(pieces[id(c)] for c in sel_chunks)
+        return raw, device_time
+
+    def prefix_lookup_device(self, image: bytes,
+                             queries: List[int]) -> List[bytes]:
+        """S6 device arm: publish the 32-byte-record index image into
+        this slot's scratch and scan it with ONE PIND-11 execute.
+        Returns the matched records (32B each)."""
+        if self.kv_flow != "vslm":
+            raise RuntimeError("prefix_lookup device path needs vslm flow")
+        if not image or len(image) % 32 != 0 or not queries:
+            return []
+        slot = self._flow_slot()
+        s_base, s_len = self._slot_scratch(slot)
+        out_off = ((len(image) + 4095) // 4096) * 4096
+        win_len = len(queries) * (32 + self._SLM_TRAILER)
+        if out_off + win_len > s_len:
+            raise RuntimeError("prefix index + window exceed scratch")
+        mmode = f"prefix_index_{self.kv_flow}"
+        self._flow_store_write(self.slm_nsid, s_base, image, mmode)
+        desc = self._slm_descriptor(
+            "prefix_lookup",
+            [{"src_mr": 1, "src_off": 0, "len": len(image)}],
+            flags=len(queries), queries=queries)
+        extra = {"output_mr_id": 1, "output_offset": int(out_off),
+                 "output_length": int(win_len),
+                 "kv_flow": self.kv_flow, "phase": "read"}
+        _, matched = self._slm_execute("prefix_lookup", slot, desc, extra)
+        if matched <= 0:
+            return []
+        window = self._flow_store_read(
+            self.slm_nsid, s_base + out_off,
+            matched * (32 + self._SLM_TRAILER), mmode)
+        return [window[i * 32:(i + 1) * 32] for i in range(matched)]
+
+    def migrate_extents(self, moves: List[Dict[str, Any]]) -> float:
+        """S3 capability: multi-extent SLM->SLM copy in ONE device
+        command (PIND 13). NOT wired to a measured benchmark consumer:
+        the tier ladder has no device-resident->device-resident demotion
+        (cpu->nvme demotions carry host-resident data by physics). The
+        twin golden test drives this; a measured consumer is a future
+        operator-approved workload change. Returns device latency (s)."""
+        slot = self._flow_slot()
+        desc = self._slm_descriptor("migrate", moves)
+        extra = {"kv_flow": self.kv_flow, "phase": "write"}
+        result, served = self._slm_execute("migrate", slot, desc, extra)
+        if served != len(moves):
+            raise RuntimeError(f"migrate served {served}/{len(moves)}")
+        return float(result.command_latency_s)
 
     def _store_packed_payload(self, key: str, packed_payload: bytes, meta: Dict[str, Any]) -> float:
         """
@@ -1828,8 +2022,13 @@ class CPCSNVMeBackend(StorageBackend):
         else:
             ordered = ks
         got: Dict[str, Tuple[np.ndarray, StorageBackend.IOTiming]] = {}
-        for key in ordered:
-            got[key] = self.read(key)
+        self._batch_local.active = (
+            self.offload_stages.get("s4") == "device")
+        try:
+            for key in ordered:
+                got[key] = self.read(key)
+        finally:
+            self._batch_local.active = False
         return {k: got[k] for k in ks}
 
     def delete(self, key: str):
@@ -1886,6 +2085,9 @@ class CPCSNVMeBackend(StorageBackend):
         summary["cpcs_flow_mem_requests_total"] = int(self._flow_mem_requests_total)
         summary["cpcs_flow_host_kernel_s_total"] = float(
             self._flow_host_kernel_s_total)
+        summary["cpcs_slm_device_execs"] = int(self._slm_device_execs)
+        summary["cpcs_slm_device_fallbacks"] = int(
+            self._slm_device_fallbacks)
         summary["cpcs_flow_rsids"] = int(self.kv_flow_rsids)
         if self.bootstrap_status:
             summary["cpcs_bootstrap"] = dict(self.bootstrap_status)

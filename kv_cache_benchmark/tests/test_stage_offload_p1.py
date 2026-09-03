@@ -34,8 +34,11 @@ def test_parse_offload_stages_rejects_unknown_and_device():
         parse_offload_stages("s9=host")
     with pytest.raises(ValueError, match="invalid mode"):
         parse_offload_stages("s2=fast")
-    with pytest.raises(ValueError, match="not wired yet"):
-        parse_offload_stages("s2=device")
+    # P3 unlocked device for s2/s4/s6; s3/s5 stay rejected (no wired
+    # measured consumer) -- the full matrix lives in the P3 suite.
+    with pytest.raises(ValueError, match="not wired"):
+        parse_offload_stages("s3=device")
+    assert parse_offload_stages("s2=device")["s2"] == "device"
 
 
 def test_decode_read_policy_validation():
