@@ -625,6 +625,17 @@ class IntegratedBenchmark:
                         prev_keys = self.conversation_manager.get_all_previous_turn_keys(
                             request.conversation_id, request.turn_number
                         )
+                        if not prev_keys and request.conversation_id:
+                            # 09-05 (STAGE night BUG 5): DATASET-path
+                            # conversations are never registered with the
+                            # manager (only the synthetic path calls
+                            # add_turn), so this stage was a no-op on
+                            # ShareGPT all along (f9 multi_turn hits = 0).
+                            # The prior-turn keys are deterministic from
+                            # the trace's own cache_key convention.
+                            prev_keys = [
+                                f"{request.conversation_id}_turn_{k}"
+                                for k in range(1, request.turn_number)]
                         batch_reads = self.cache.access_cache_many(prev_keys, InferencePhase.DECODE, 'multi_turn')
                         for _, location, read_latency in batch_reads:
                             if location is not None:

@@ -1618,38 +1618,60 @@ class CPCSNVMeBackend(StorageBackend):
         for slot, chunks in sorted(groups.items()):
             a_base, _ = self._slot_arena(slot)
             s_base, s_len = self._slot_scratch(slot)
-            entries = [{"src_mr": 2,
-                        "src_off": int(c["rel_off"]) - a_base,
-                        "len": int(c["packed_len"]),
-                        "raw_len": int(c["raw_len"]),
-                        "mode": mode_int} for c in chunks]
-            payload_total = sum(int(c["raw_len"]) for c in chunks)
-            win_len = payload_total + len(entries) * self._SLM_TRAILER
-            if win_len > s_len:
-                raise RuntimeError(
-                    f"slm select window {win_len} exceeds scratch {s_len}")
-            desc = self._slm_descriptor("block_select", entries)
-            extra = {"output_mr_id": 1, "output_offset": 0,
-                     "output_length": int(win_len),
-                     "kv_flow": self.kv_flow, "phase": "read"}
-            result, served = self._slm_execute("block_select", slot, desc,
-                                               extra, kmode)
-            device_time += float(result.command_latency_s)
-            if served != len(entries):
-                raise RuntimeError(
-                    f"slm select served {served}/{len(entries)}")
-            window = self._flow_store_read(self.slm_nsid, s_base,
-                                           win_len, mmode)
-            tbase = payload_total
-            for i, c in enumerate(chunks):
-                t = window[tbase + i * self._SLM_TRAILER:
-                           tbase + (i + 1) * self._SLM_TRAILER]
-                rel_off, out_len, crc = struct.unpack("<III", t[:12])
-                piece = window[rel_off:rel_off + out_len]
-                if (out_len != int(c["raw_len"]) or
-                        (zlib.crc32(piece) & 0xFFFFFFFF) != crc):
-                    raise IOError("slm select trailer/crc mismatch")
-                pieces[id(c)] = piece
+            # 09-05 (STAGE night BUG 4): decode windows reach tens of MiB
+            # while a slot's scratch slice is scratch_mb/rsids (4 MiB at
+            # the defaults) -- the un-batched window overflowed on 100%
+            # of attempts. Split the selection into window-budget batches
+            # (one execute + one window read per batch); command count is
+            # ceil(bytes/slice) instead of 1 -- still far below
+            # per-chunk. A SINGLE chunk that cannot fit is a hard error
+            # (falls back, counted).
+            batches: List[List[Dict[str, Any]]] = []
+            cur: List[Dict[str, Any]] = []
+            cur_len = 0
+            for c in chunks:
+                need = int(c["raw_len"]) + self._SLM_TRAILER
+                if need > s_len:
+                    raise RuntimeError(
+                        f"slm select single chunk {need} exceeds scratch "
+                        f"slice {s_len}")
+                if cur and cur_len + need > s_len:
+                    batches.append(cur)
+                    cur, cur_len = [], 0
+                cur.append(c)
+                cur_len += need
+            if cur:
+                batches.append(cur)
+            for batch in batches:
+                entries = [{"src_mr": 2,
+                            "src_off": int(c["rel_off"]) - a_base,
+                            "len": int(c["packed_len"]),
+                            "raw_len": int(c["raw_len"]),
+                            "mode": mode_int} for c in batch]
+                payload_total = sum(int(c["raw_len"]) for c in batch)
+                win_len = payload_total + len(entries) * self._SLM_TRAILER
+                desc = self._slm_descriptor("block_select", entries)
+                extra = {"output_mr_id": 1, "output_offset": 0,
+                         "output_length": int(win_len),
+                         "kv_flow": self.kv_flow, "phase": "read"}
+                result, served = self._slm_execute("block_select", slot,
+                                                   desc, extra, kmode)
+                device_time += float(result.command_latency_s)
+                if served != len(entries):
+                    raise RuntimeError(
+                        f"slm select served {served}/{len(entries)}")
+                window = self._flow_store_read(self.slm_nsid, s_base,
+                                               win_len, mmode)
+                tbase = payload_total
+                for i, c in enumerate(batch):
+                    t = window[tbase + i * self._SLM_TRAILER:
+                               tbase + (i + 1) * self._SLM_TRAILER]
+                    rel_off, out_len, crc = struct.unpack("<III", t[:12])
+                    piece = window[rel_off:rel_off + out_len]
+                    if (out_len != int(c["raw_len"]) or
+                            (zlib.crc32(piece) & 0xFFFFFFFF) != crc):
+                        raise IOError("slm select trailer/crc mismatch")
+                    pieces[id(c)] = piece
         raw = b"".join(pieces[id(c)] for c in sel_chunks)
         return raw, device_time
 
@@ -1669,6 +1691,7 @@ class CPCSNVMeBackend(StorageBackend):
         if out_off + win_len > s_len:
             raise RuntimeError("prefix index + window exceed scratch")
         mmode = f"prefix_index_{self.kv_flow}"
+        t0 = time.perf_counter()
         self._flow_store_write(self.slm_nsid, s_base, image, mmode)
         desc = self._slm_descriptor(
             "prefix_lookup",
@@ -1677,13 +1700,25 @@ class CPCSNVMeBackend(StorageBackend):
         extra = {"output_mr_id": 1, "output_offset": int(out_off),
                  "output_length": int(win_len),
                  "kv_flow": self.kv_flow, "phase": "read"}
-        _, matched = self._slm_execute("prefix_lookup", slot, desc, extra)
-        if matched <= 0:
-            return []
-        window = self._flow_store_read(
-            self.slm_nsid, s_base + out_off,
-            matched * (32 + self._SLM_TRAILER), mmode)
-        return [window[i * 32:(i + 1) * 32] for i in range(matched)]
+        result, matched = self._slm_execute("prefix_lookup", slot, desc,
+                                            extra)
+        recs: List[bytes] = []
+        if matched > 0:
+            window = self._flow_store_read(
+                self.slm_nsid, s_base + out_off,
+                matched * (32 + self._SLM_TRAILER), mmode)
+            recs = [window[i * 32:(i + 1) * 32] for i in range(matched)]
+        # 09-05 (STAGE night BUG 3): fold the lookup's device time into
+        # the active stage (prefix) -- previously S6's round-trips were
+        # visible only in wall_s and device_s read 0 exactly where the
+        # ablation acts.
+        total = time.perf_counter() - t0
+        exec_s = float(result.command_latency_s)
+        stage_metrics.note_io(StorageBackend.IOTiming(
+            total=total, device=exec_s,
+            host=max(0.0, total - exec_s),
+            components={"exec_cmd": exec_s}))
+        return recs
 
     def migrate_extents(self, moves: List[Dict[str, Any]]) -> float:
         """S3 capability: multi-extent SLM->SLM copy in ONE device
