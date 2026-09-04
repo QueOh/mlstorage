@@ -56,11 +56,9 @@ def test_slm_descriptor_ops_and_queries():
 
 
 def test_offload_stage_device_unlock_matrix():
-    d = parse_offload_stages("s2=device,s4=device,s6=device")
-    assert d["s2"] == "device" and d["s4"] == "device" and d["s6"] == "device"
-    for blocked in ("s3=device", "s5=device"):
-        with pytest.raises(ValueError, match="not wired"):
-            parse_offload_stages(blocked)
+    d = parse_offload_stages(
+        "s2=device,s3=device,s4=device,s5=device,s6=device")
+    assert all(d[k] == "device" for k in ("s2", "s3", "s4", "s5", "s6"))
 
 
 def test_client_cparam1_flag_emission():

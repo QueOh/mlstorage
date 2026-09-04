@@ -8,6 +8,7 @@ stress the cache with large context sizes and unique I/O patterns.
 import hashlib
 import random
 import logging
+import struct
 import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -103,6 +104,11 @@ class RAGDocumentManager:
             'chunks_created': 0,
             'retrieval_requests': 0,
             'chunks_retrieved': 0,
+            # S5 device arm (09-05)
+            'rag_device_lookups': 0,
+            'rag_device_mismatches': 0,
+            'rag_device_ties': 0,
+            'rag_device_errors': 0,
         }
 
     def ingest_document(self, doc_id: str, total_tokens: int, model_config: ModelConfig):
@@ -256,6 +262,61 @@ class RAGDocumentManager:
         order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
         return order[:k]
 
+    @staticmethod
+    def _device_images(doc: 'RAGDocument'):
+        """32-byte metadata records (doc_id = vector_index = chunk idx)
+        + the contiguous f32 embedding block -- the eval-family layout
+        filtered_topk_exact scans. Cached per doc."""
+        if getattr(doc, "_dev_images", None) is None:
+            recs = [struct.pack("<QIIHHfII", i, 0, 0, 0, 0, 0.0, 0, i)
+                    for i in range(doc.embeddings.shape[0])]
+            doc._dev_images = (
+                b"".join(recs),
+                np.ascontiguousarray(doc.embeddings,
+                                     dtype=np.float32).tobytes())
+        return doc._dev_images
+
+    def _retrieve_device(self, doc: 'RAGDocument', query: np.ndarray,
+                         host_idx: List[int]) -> Optional[List[int]]:
+        """S5 device arm: ONE filtered_topk_exact execute over the doc's
+        staged index. Parity vs the host scorer: a REAL mismatch needs a
+        differing id whose score is separated from the k-th score beyond
+        float32 noise; anything closer is a tie (counted separately --
+        device and numpy accumulate f32 in different orders). Any error
+        falls back to the host result, counted."""
+        backend = getattr(self.cache, 'backends', {}).get('nvme')
+        fn = getattr(backend, 'rag_topk_device', None)
+        if fn is None:
+            return None
+        try:
+            meta_img, vec_img = self._device_images(doc)
+            k = min(self.top_k_chunks, doc.embeddings.shape[0])
+            dev_ids = fn(meta_img, vec_img,
+                         np.ascontiguousarray(query,
+                                              dtype=np.float32).tobytes(),
+                         k, int(doc.embeddings.shape[1]))
+            with self.lock:
+                self.stats['rag_device_lookups'] += 1
+            if set(dev_ids) != set(host_idx):
+                scores = doc.embeddings @ query
+                kth = float(np.sort(scores)[-k])
+                diff = set(dev_ids) ^ set(host_idx)
+                real = any(abs(float(scores[i]) - kth) > 1e-5
+                           for i in diff if 0 <= i < len(scores))
+                with self.lock:
+                    if real:
+                        self.stats['rag_device_mismatches'] += 1
+                    else:
+                        self.stats['rag_device_ties'] += 1
+            return [int(i) for i in dev_ids
+                    if 0 <= int(i) < len(doc.chunks)]
+        except Exception as exc:
+            logger.warning("rag device retrieval fell back to host: %s",
+                           exc)
+            with self.lock:
+                self.stats['rag_device_errors'] += 1
+            return None
+
     def retrieve_chunks(self, doc_id: str,
                         query_seed: Optional[int] = None) -> List[RAGChunk]:
         """
@@ -279,6 +340,10 @@ class RAGDocumentManager:
             query = self.query_embedding(qseed)
             retrieved_indices = self.topk_host(
                 doc.embeddings, query, self.top_k_chunks)
+            if self.mode == 'device':
+                dev = self._retrieve_device(doc, query, retrieved_indices)
+                if dev is not None:
+                    retrieved_indices = dev
         else:
             chunk_probabilities = self._compute_chunk_probabilities(len(doc.chunks))
             retrieved_indices = np.random.choice(

@@ -217,6 +217,9 @@ class CPCSNVMeBackend(StorageBackend):
         # graceful fallbacks to the per-chunk host path (each logged).
         self._slm_device_execs = 0
         self._slm_device_fallbacks = 0
+        # S3 maintenance (09-05): exhaustion-triggered arena compactions.
+        self._maintenance_compactions = 0
+        self._maintenance_extents_moved = 0
         self._batch_local = _threading.local()
         if self.kv_flow in ("pslm", "vslm"):
             self._flow_bootstrap_mrs()
@@ -1344,7 +1347,8 @@ class CPCSNVMeBackend(StorageBackend):
                 # Device encoders raw-fallback when output >= input, so the
                 # result never exceeds the chunk; +4096 covers containers.
                 if self.kv_flow == "vslm":
-                    rel_g = self._flow_alloc(len(chunk) + 4096, slot)
+                    rel_g = self._flow_alloc_with_maintenance(
+                        len(chunk) + 4096, slot)
                     allocs.append(rel_g)
                     out_cap = len(chunk) + 4096
                     out_rel = rel_g - self._slot_arena(slot)[0]
@@ -1719,6 +1723,183 @@ class CPCSNVMeBackend(StorageBackend):
             host=max(0.0, total - exec_s),
             components={"exec_cmd": exec_s}))
         return recs
+
+    # ---- S5: device RAG retrieval via filtered_topk_exact (PIND 6) -----
+    # Eval-family typed ABI (include/spdk/nvme_cpcs_builtin_eval.h @
+    # e7378f40a): req 100 B, result header 104 B + 8 B (metric/k/rsvd),
+    # 16 B records {doc_id u64, score f32, rsvd}. Metadata records 32 B.
+    _EVAL_TOPK_PIND = 6
+    _EVAL_OP_TOPK = 2
+    _EVAL_METRIC_COSINE = 1
+    _EVAL_FLAG_RETURN_SCORES = 1 << 1
+    _EVAL_FLAG_STABLE_TIE = 1 << 2
+    _EVAL_RESULT_RECORDS_OFF = 112
+
+    def rag_topk_device(self, meta_image: bytes, vec_image: bytes,
+                        query_f32: bytes, k: int, dim: int) -> List[int]:
+        """S5 device arm: stage the chunk metadata records + embedding
+        block into this slot's scratch MR and run ONE filtered_topk_exact
+        execute; returns doc_ids (chunk indices) in device rank order.
+        vslm flow only; raises on any failure (caller counts + falls
+        back to the host scorer)."""
+        if self.kv_flow != "vslm":
+            raise RuntimeError("rag_topk_device needs the vslm flow")
+        n = len(meta_image) // 32
+        if n == 0 or len(meta_image) % 32 or len(query_f32) != dim * 4:
+            raise RuntimeError("rag_topk_device bad image/query shape")
+        k = min(int(k), n)
+        slot = self._flow_slot()
+        s_base, s_len = self._slot_scratch(slot)
+        meta_off = 0
+        vec_off = ((len(meta_image) + 4095) // 4096) * 4096
+        out_off = vec_off + ((len(vec_image) + 4095) // 4096) * 4096
+        out_len = self._EVAL_RESULT_RECORDS_OFF + k * 16
+        if out_off + out_len > s_len:
+            raise RuntimeError("rag index + result exceed scratch slice")
+        mmode = f"rag_topk_{self.kv_flow}"
+        t0 = time.perf_counter()
+        self._flow_store_write(self.slm_nsid, s_base + meta_off,
+                               meta_image, mmode)
+        self._flow_store_write(self.slm_nsid, s_base + vec_off,
+                               vec_image, mmode)
+        hdr = struct.pack("<IHHQQII", 1, self._EVAL_OP_TOPK,
+                          self._EVAL_FLAG_RETURN_SCORES |
+                          self._EVAL_FLAG_STABLE_TIE,
+                          1, out_off, out_len, 0)
+        body = struct.pack("<QQQQQIIIHHHHII",
+                           1, meta_off, 1, vec_off, n,
+                           32, dim, dim * 4,
+                           self._EVAL_METRIC_COSINE, k, 0, 0,
+                           dim * 4, 0)
+        payload = hdr + body + query_f32
+        rsid = (self._flow_rsids[slot] if self._flow_rsids
+                else self._flow_rsid)
+        with self._exec_locks[slot % len(self._exec_locks)]:
+            result = self.client.execute(
+                cpcs_nsid=self.cpcs_nsid, rsid=rsid,
+                pind=self._EVAL_TOPK_PIND, payload=payload,
+                op="filtered_topk_exact", mode="noop", extra={},
+                raw_payload=True)
+        self._slm_device_execs += 1
+        raw = int(result.extra.get("result_raw",
+                                   result.extra.get("result_dw0", 0)) or 0)
+        returned = int(result.extra.get("result_value",
+                                        raw & 0xFFFFFFFF) or 0)
+        returned = min(returned, k)
+        if returned <= 0:
+            raise RuntimeError("rag_topk_device returned 0 records")
+        window = self._flow_store_read(
+            self.slm_nsid, s_base + out_off,
+            self._EVAL_RESULT_RECORDS_OFF + returned * 16, mmode)
+        status = struct.unpack_from("<H", window, 6)[0]
+        if status != 0:
+            raise RuntimeError(f"rag_topk_device status {status}")
+        ids = [int(struct.unpack_from(
+            "<Q", window, self._EVAL_RESULT_RECORDS_OFF + i * 16)[0])
+            for i in range(returned)]
+        total = time.perf_counter() - t0
+        exec_s = float(result.command_latency_s)
+        stage_metrics.note_io(StorageBackend.IOTiming(
+            total=total, device=exec_s, host=max(0.0, total - exec_s),
+            components={"exec_cmd": exec_s}))
+        return ids
+
+    # ---- S3: arena compaction (the maintenance stage) -------------------
+    # Real consumer for kv_migrate: the recurring per-slot arena-slice
+    # exhaustion (f9 BUG-1 / STAGE BUG-9) is fragmentation of per-chunk
+    # extents in a hot slot. On exhaustion with s3 enabled, compact the
+    # slot -- host arm reads+rewrites each live extent through the
+    # initiator; device arm issues kv_migrate (PIND 13) batches and the
+    # bytes never cross the fabric.
+    #
+    # CONCURRENCY DISCLOSURE: readers do not take the alloc lock; a
+    # reader holding pre-compaction chunk metadata can race a later
+    # extent's landing on the space an earlier extent vacated. The
+    # per-chunk CRC (09-05) backstops this as an IOError rather than
+    # silent corruption; compaction is rare (exhaustion-triggered) and
+    # slot-local.
+
+    def _flow_alloc_with_maintenance(self, length: int, slot: int) -> int:
+        try:
+            return self._flow_alloc(length, slot)
+        except RuntimeError as exc:
+            if ("arena slice exhausted" not in str(exc)
+                    or self.offload_stages.get("s3") not in ("host",
+                                                             "device")):
+                raise
+            device = self.offload_stages.get("s3") == "device"
+            with stage_metrics.stage("maintenance"):
+                moved = self._flow_compact_slot(slot, device=device)
+            self._maintenance_compactions += 1
+            self._maintenance_extents_moved += moved
+            logger.warning(
+                "arena slot %d compacted after exhaustion (%d extents, "
+                "s3=%s); retrying allocation", slot, moved,
+                self.offload_stages.get("s3"))
+            return self._flow_alloc(length, slot)
+
+    def _flow_compact_slot(self, slot: int, device: bool) -> int:
+        align = max(4096, int(self.slm_rw_lba_bytes) or 4096)
+        base, _size = self._slot_arena(slot)
+        arena_ns_base = self.kv_scratch_bytes
+        mmode = f"compact_{self.kv_flow}"
+        with self._flow_alloc_lock:
+            items = []
+            for key, meta in list(self.metadata.items()):
+                if not isinstance(meta, dict) or meta.get("kv_flow") != "vslm":
+                    continue
+                for ci, c in enumerate(meta.get("chunks", [])):
+                    off = c.get("rel_off")
+                    if (isinstance(off, int)
+                            and self._arena_slot_of(off) == slot):
+                        resv_len = self._flow_resv["vslm"].get(
+                            off, int(c.get("raw_len", 0)) + 4096)
+                        items.append((off, int(resv_len),
+                                      int(c.get("packed_len", 0)) or 1,
+                                      key, ci))
+            items.sort()
+            cursor = base
+            plan = []
+            moves: List[Dict[str, Any]] = []
+            for off, resv_len, packed_len, key, ci in items:
+                new_off = self._align_up(cursor, align)
+                plan.append((off, new_off, resv_len, key, ci))
+                if new_off != off:
+                    moves.append({"src_mr": 2, "src_off": off - base,
+                                  "dst_mr": 2, "dst_off": new_off - base,
+                                  "len": packed_len})
+                cursor = new_off + resv_len
+            if moves:
+                if device:
+                    for i in range(0, len(moves), 64):
+                        self.migrate_extents(moves[i:i + 64])
+                else:
+                    for m in moves:
+                        data = self._flow_store_read(
+                            self.slm_nsid,
+                            arena_ns_base + base + int(m["src_off"]),
+                            int(m["len"]), mmode)
+                        self._flow_store_write(
+                            self.slm_nsid,
+                            arena_ns_base + base + int(m["dst_off"]),
+                            data, mmode)
+            new_resv: Dict[int, int] = {}
+            touched = set()
+            for off, new_off, resv_len, key, ci in plan:
+                self.metadata[key]["chunks"][ci]["rel_off"] = new_off
+                self._flow_resv["vslm"].pop(off, None)
+                new_resv[new_off] = resv_len
+                touched.add(key)
+            self._flow_resv["vslm"].update(new_resv)
+            self._flow_free["vslm"][slot] = []
+            self._vslm_arena_next[slot] = cursor - base
+            for key in touched:
+                try:
+                    self._meta_path(key).write_text(
+                        json.dumps(self.metadata[key]), encoding="utf-8")
+                except Exception:
+                    pass
+            return len(moves)
 
     def migrate_extents(self, moves: List[Dict[str, Any]]) -> float:
         """S3 capability: multi-extent SLM->SLM copy in ONE device
@@ -2123,6 +2304,10 @@ class CPCSNVMeBackend(StorageBackend):
         summary["cpcs_slm_device_execs"] = int(self._slm_device_execs)
         summary["cpcs_slm_device_fallbacks"] = int(
             self._slm_device_fallbacks)
+        summary["cpcs_maintenance_compactions"] = int(
+            self._maintenance_compactions)
+        summary["cpcs_maintenance_extents_moved"] = int(
+            self._maintenance_extents_moved)
         summary["cpcs_flow_rsids"] = int(self.kv_flow_rsids)
         if self.bootstrap_status:
             summary["cpcs_bootstrap"] = dict(self.bootstrap_status)

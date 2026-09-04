@@ -1541,6 +1541,7 @@ class IntegratedBenchmark:
         cache_stats = self.cache.get_stats(duration)
         qos_metrics = self.qos_monitor.get_all_qos_metrics()
         prefix_stats = self.prefix_cache_manager.stats if self.prefix_cache_manager else {}
+        rag_stats = self.rag_manager.get_stats() if self.rag_manager else {}
         autoscaling_stats = self.autoscaler.scaling_history if self.autoscaler else []
         system_metrics = self.system_metrics_tracker.summary()
 
@@ -1598,6 +1599,7 @@ class IntegratedBenchmark:
             'cache_stats': cache_stats,
             'qos_metrics': qos_metrics,
             'prefix_cache_stats': prefix_stats,
+            'rag_stats': rag_stats,
             'autoscaling_stats': autoscaling_stats,
             'autoscaling_summary': autoscaling_summary,
             'system_metrics': system_metrics,

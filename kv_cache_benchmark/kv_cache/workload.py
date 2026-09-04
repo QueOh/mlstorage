@@ -155,13 +155,9 @@ def parse_offload_stages(spec: str) -> Dict[str, str]:
         if v not in OFFLOAD_STAGE_VALUES:
             raise ValueError(f"--offload-stages invalid mode '{v}' for "
                              f"{k} (off|host|device)")
-        if v == 'device' and k in ('s3', 's5'):
-            # s3: the tier ladder has no device-resident->device-resident
-            # demotion (migrate is a twin-tested capability without a
-            # measured consumer); s5: PIND-6 retrieval wiring is a
-            # follow-up. Failing loudly beats mislabeling a host arm.
-            raise ValueError(f"--offload-stages {k}=device is not wired; "
-                             f"use host or off")
+        # 09-05: all five stages have device arms -- s3 = exhaustion-
+        # triggered arena compaction via kv_migrate (the maintenance
+        # stage), s5 = filtered_topk_exact retrieval. vslm flow only.
         out[k] = v
     return out
 

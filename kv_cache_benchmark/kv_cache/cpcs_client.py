@@ -852,14 +852,20 @@ class SpdkPassthruCPCSClient(CPCSClient):
         if isinstance(extra, dict):
             extra_map = dict(extra)
 
-        framed_payload = self._build_cpcs_request_payload(
-            op=op,
-            mode=mode,
-            payload=payload,
-            shape=shape_list,
-            dtype=dtype_str,
-            extra=extra_map,
-        )
+        if kwargs.get("raw_payload"):
+            # 09-05 (S5): eval-family builtins (filter_agg /
+            # filtered_topk_exact) take a TYPED struct as the DPTR
+            # payload -- no CPCSREQ1 envelope.
+            framed_payload = bytes(payload)
+        else:
+            framed_payload = self._build_cpcs_request_payload(
+                op=op,
+                mode=mode,
+                payload=payload,
+                shape=shape_list,
+                dtype=dtype_str,
+                extra=extra_map,
+            )
 
         with tempfile.NamedTemporaryFile(prefix="cpcs_exec_", suffix=".bin", delete=False) as tf:
             tf.write(framed_payload)
